@@ -1,0 +1,200 @@
+pip install sns pandas numpy matplotlib seaborn scipy scikit-learn
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+import re
+
+from scipy.stats import binomtest
+
+train = pd.read_csv('/content/train.csv')
+test = pd.read_csv('/content/test.csv')
+
+# Exploratory Data Analysis
+
+train.info()
+test.info()
+
+print(f"\nWin distribution:")
+print(f"  model_a wins: {train['winner_model_a'].sum() / len(train)}")
+print(f"  model_b wins: {train['winner_model_b'].sum() / len(train)}")
+print(f"  tie:          {train['winner_tie'].sum() / len(train)}")
+print(f"\nNull counts:\n{train.isnull().sum()}")
+
+# Fig 1. Pie Chart of Win Distribution
+win_counts = [train['winner_model_a'].sum(), train['winner_model_b'].sum(), train['winner_tie'].sum()]
+plt.pie(win_counts, labels=['model_a', 'model_b', 'tie'], startangle=90, autopct='%.1f%%')
+plt.axis('equal')
+plt.title('Model Win/Tie Distribution')
+plt.show()
+
+# Binomial Test on Left / Right Bias
+ab_only = train.loc[train['winner_tie'] == 0].copy()
+wins_a = (ab_only['winner_model_a'] == 1).sum()
+wins_b = (ab_only['winner_model_b'] == 1).sum()
+
+print(f"\n{binomtest(wins_a, n=wins_a + wins_b, p=0.5)}")
+
+# Binomial Test on Response Length
+train['prompt_len'] = train['prompt'].str.len()
+train['resp_a_len'] = train['response_a'].str.len()
+train['resp_b_len'] = train['response_b'].str.len()
+
+print(f"\n{train[['prompt_len', 'resp_a_len', 'resp_b_len']].describe()}")
+
+train['len_diff'] = train['resp_b_len'] - train['resp_a_len']
+train['winner'] = np.select(
+    [train['winner_model_a']==1, train['winner_model_b']==1],
+    ['A', 'B'],
+    default='Tie'
+)
+
+print(f"\n{train.groupby('winner')['len_diff'].mean()}")
+
+longer_wins = (
+    ((train['len_diff'] < 0) & (train['winner'] == 'A')) | # A longer and A won
+    ((train['len_diff'] > 0) & (train['winner'] == 'B'))   # B longer and B won
+)
+
+k = longer_wins.sum()    # number of times longer response won
+n = (train['winner'].isin(['A', 'B'])).sum() # number of non-ties
+
+result = binomtest(k, n=n, p=0.5)
+print(f"\n{result}")
+print(f"\nLonger response win rate: {k / n:.4f}")
+
+# Fig 2. Length Difference Between Winning and Losing Responses
+length_diff = np.where(
+    train['winner_model_a'] == 1,
+    train['resp_a_len'] - train['resp_b_len'],
+    train['resp_b_len'] - train['resp_a_len']
+)
+
+plt.figure()
+plt.boxplot(length_diff, showfliers=False)
+plt.axhline(0)
+plt.ylabel('Length Difference (Winning − Losing)')
+plt.title('Length Difference Between Winning and Losing Responses')
+plt.show()
+
+# Data Preparation
+
+# Returns one normalized string
+def joined(x):
+    if pd.isna(x):
+        return ""
+    if isinstance(x, list):
+        return "\n\n".join(map(str, x))
+    if isinstance(x, str):
+        s = x.strip()
+
+        # Parse JSON-like list strings safely
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return "\n\n".join(map(str, parsed))
+            except Exception:
+                # fall back to original string if it isn't valid JSON
+                return s
+
+        return s
+
+    return str(x)
+
+# Determines % of prompt keywords that also appear in the response
+def overlap(a, b):
+    a_set = set(a.lower().split())
+    b_set = set(b.lower().split())
+    return len(a_set & b_set) / max(len(a_set), 1)
+
+# Feature Engineering
+def engineer(df: pd.DataFrame) -> pd.DataFrame:
+  df = df.copy()
+
+  # Normalize the text fields
+  for col in ["prompt", "response_a", "response_b"]:
+      if col in df.columns:
+          df[col] = df[col].apply(joined)
+      else:
+          # In case a column is missing for some reason
+          df[col] = ""
+
+  # Prompt features
+  df['prompt_len'] = df['prompt'].str.len()
+
+  # Response A structural features
+  df['resp_a_len'] = df['response_a'].str.len()
+  df['resp_a_bold'] = df['response_a'].str.count(r'\*\*')
+  df['resp_a_hash'] = df['response_a'].str.count(r'##')
+  df['resp_a_new_line'] = df['response_a'].str.count(r'\n')
+  df['resp_a_code'] = df['response_a'].str.count(r'`')
+  df['resp_a_list'] = df['response_a'].str.count(r"(?m)^\s*(?:\d+\.|\-|\*|\+)\s+")
+  df['resp_a_exclamation'] = df['response_a'].str.count(r'!')
+  df['resp_a_question'] = df['response_a'].str.count(r'\?')
+  df['resp_a_quote'] = df['response_a'].str.count(r'"')
+  df["resp_a_sentences"] = df["response_a"].str.count(r"[.!?]")
+
+  # Response B structural features
+  df['resp_b_len'] = df['response_b'].str.len()
+  df['resp_b_bold'] = df['response_b'].str.count(r'\*\*')
+  df['resp_b_hash'] = df['response_b'].str.count(r'##')
+  df['resp_b_new_line'] = df['response_b'].str.count(r'\n')
+  df['resp_b_code'] = df['response_b'].str.count(r'`')
+  df['resp_b_list'] = df['response_b'].str.count(r"(?m)^\s*(?:\d+\.|\-|\*|\+)\s+")
+  df['resp_b_exclamation'] = df['response_b'].str.count(r'!')
+  df['resp_b_question'] = df['response_b'].str.count(r'\?')
+  df['resp_b_quote'] = df['response_b'].str.count(r'"')
+  df["resp_b_sentences"] = df["response_b"].str.count(r"[.!?]")
+
+  # Words denoting uncertainty
+  uncertainty = r"\b(might|may|could|depends|possibly|often)\b"
+
+  # Words denoting confidence
+  confidence = r"\b(will|must|always|never|definitely)\b"
+
+  # Response A semantic features
+  df['resp_a_overlap'] = df.apply(lambda r: overlap(r['prompt'], r['response_a']), axis=1)
+  df['resp_a_uncertain'] = df['response_a'].str.count(uncertainty, flags=re.I)
+  df['resp_a_confidence'] = df['response_a'].str.count(confidence, flags=re.I)
+  df['resp_a_is_ai'] = train['response_a'].astype(str).str.lower().str.count(r'an ai')
+
+  # Response B semantic features
+  df['resp_b_overlap'] = df.apply(lambda r: overlap(r['prompt'], r['response_b']), axis=1)
+  df['resp_b_uncertain'] = df['response_b'].str.count(uncertainty, flags=re.I)
+  df['resp_b_confidence'] = df['response_b'].str.count(confidence, flags=re.I)
+  df['resp_b_is_ai'] = df['response_b'].astype(str).str.lower().str.count(r'an ai')
+
+  # Response A and B diff
+  df['len_diff'] = df['resp_b_len'] - df['resp_a_len']
+  df['bold_diff'] = df['resp_b_bold'] - df['resp_a_bold']
+  df['hash_diff'] = df['resp_b_hash'] - df['resp_a_hash']
+  df['new_line_diff'] = df['resp_b_new_line'] - df['resp_a_new_line']
+  df['code_diff'] = df['resp_b_code'] - df['resp_a_code']
+  df['list_diff'] = df['resp_b_list'] - df['resp_a_list']
+  df['exclamation_diff'] = df['resp_b_exclamation'] - df['resp_a_exclamation']
+  df['question_diff'] = df['resp_b_question'] - df['resp_a_question']
+  df['quote_diff'] = df['resp_b_quote'] - df['resp_a_quote']
+  df['sentence_diff'] = df['resp_b_sentences'] - df['resp_a_sentences']
+  df['overlap_diff'] = df['resp_b_overlap'] - df['resp_a_overlap']
+  df['uncertain_diff'] = df['resp_b_uncertain'] - df['resp_a_uncertain']
+  df['confidence_diff'] = df['resp_b_confidence'] - df['resp_a_confidence']
+  df['ai_overal'] = df['resp_b_is_ai'] - df['resp_a_is_ai']
+
+  return df
+
+engineer(train)
+engineer(test)
+
+feature_cols = ['resp_a_bold', 'resp_b_bold', 'bold_diff',
+                'resp_a_hash', 'resp_b_hash', 'hash_diff',
+                'resp_a_new_line', 'resp_b_new_line', 'new_line_diff',
+                'resp_a_code', 'resp_b_code', 'code_diff',
+                'resp_a_len', 'resp_b_len', 'len_diff',
+                'resp_a_list', 'resp_b_list', 'list_diff',
+                'resp_a_exclamation', 'resp_b_exclamation', 'exclamation_diff',
+                'resp_a_question', 'resp_b_question', 'question_diff',
+                'resp_a_quote', 'resp_b_quote', 'quote_diff',
+                'resp_a_sentences', 'resp_b_sentences', 'sentence_diff'
+                ]
