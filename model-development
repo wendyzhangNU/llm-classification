@@ -1,0 +1,730 @@
+!pip install textstat textblob nltk langdetect xgboost lightgbm catboost optuna -q
+
+!python -m textblob.download_corpora lite
+
+import pandas as pd
+import numpy as np
+import re, json, time, warnings
+warnings.filterwarnings("ignore")
+
+from scipy.stats import binomtest, mannwhitneyu
+
+import nltk
+nltk.download('vader_lexicon', quiet=True)
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+import textstat
+from textblob import TextBlob
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 42
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_predict
+from sklearn.metrics import log_loss, accuracy_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity as cos_sim
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+train = pd.read_csv('/content/train.csv')
+test  = pd.read_csv('/content/test.csv')
+
+def parse_response(resp):
+    """Space-join: cleaner than newline-join, doesn't inflate char counts"""
+    try:
+        parsed = json.loads(resp)
+        if isinstance(parsed, list):
+            return ' '.join([str(t) for t in parsed])
+        return str(parsed)
+    except:
+        return str(resp)
+
+for df in [train, test]:
+    df['response_a'] = df['response_a'].apply(parse_response)
+    df['response_b'] = df['response_b'].apply(parse_response)
+    df['prompt']     = df['prompt'].fillna("").astype(str)
+
+# Winner label (train only)
+train['winner'] = np.select(
+    [train['winner_model_a']==1, train['winner_model_b']==1],
+    ['A', 'B'], default='Tie'
+)
+
+print(f"Train: {len(train):,} rows  |  Test: {len(test):,} rows")
+print(f"A wins: {(train['winner']=='A').sum():,}  "
+      f"B wins: {(train['winner']=='B').sum():,}  "
+      f"Ties: {(train['winner']=='Tie').sum():,}")
+
+def safe_detect(text):
+    try:
+        return detect(str(text)[:5000])
+    except:
+        return "unknown"
+
+for label, df in [("Train", train), ("Test", test)]:
+    print(f"Detecting languages for {label}...")
+    df['prompt_lang']  = df['prompt'].apply(safe_detect)
+    df['resp_a_lang']  = df['response_a'].apply(safe_detect)
+    df['resp_b_lang']  = df['response_b'].apply(safe_detect)
+
+print("Language detection ✓")
+
+_word_re = re.compile(r"[A-Za-z']+")
+
+def tokenize(text):
+    if not isinstance(text, str): return []
+    return _word_re.findall(text.lower())
+
+def lexical_diversity(text):
+    toks = tokenize(text)
+    return len(set(toks)) / len(toks) if toks else 0.0
+
+def count_lexicon(text, lexicon):
+    s = set(lexicon)
+    return sum(1 for t in tokenize(text) if t in s)
+
+def vocab_richness(text):
+    words = str(text).lower().split()
+    return len(set(words)) / len(words) if words else 0
+
+def keyword_overlap(prompt, response):
+    p = set(str(prompt).lower().split())
+    r = set(str(response).lower().split())
+    return len(p & r) / len(p) if p else 0
+
+def refusal_score(text):
+    text = str(text).lower()
+    score = 0
+    for phrase in ["i cannot", "i can't", "i am not able", "i'm not able",
+                   "i'm unable", "i am unable", "can't satisfy your request",
+                   "cannot satisfy your request", "i must decline",
+                   "i'm not going to", "i can not"]:
+        score += text.count(phrase) * 3
+    for phrase in ["i'm sorry", "i am sorry", "i apologize", "my apologies",
+                   "sorry,", "sorry.", "unfortunately"]:
+        score += text.count(phrase) * 2
+    for phrase in ["sorry", "apologize", "apologies", "regret"]:
+        score += text.count(phrase) * 1
+    return score
+
+def sentence_stats(text):
+    sentences = re.split(r'[.!?]+', str(text))
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return 0, 0.0, 0.0
+    lengths = [len(s.split()) for s in sentences]
+    return len(sentences), np.mean(lengths), (np.std(lengths) if len(lengths) > 1 else 0.0)
+
+HEDGE_LEXICON = {
+    "might","may","could","can","seems","seem","maybe","perhaps","likely",
+    "unlikely","generally","often","sometimes","possibly","potentially",
+    "approximately","roughly","suggest","suggests","guess","guesses",
+    "estimate","estimated","depends","unclear"
+}
+
+POLITENESS_LEXICON = {
+    "please","thanks","thank","appreciate","sorry","welcome","glad",
+    "happy","sure","certainly","kindly"
+}
+
+CONFIDENCE_RE = r"\b(will|must|always|never|definitely)\b"
+
+analyzer = SentimentIntensityAnalyzer()
+
+
+def engineer_all(df):
+    """All features from both notebooks in one pass."""
+    df = df.copy()
+    for col in ['prompt', 'response_a', 'response_b']:
+        df[col] = df[col].fillna("").astype(str)
+
+    # LENGTH
+    df['prompt_len']        = df['prompt'].str.len()
+    df['resp_a_len']        = df['response_a'].str.len()
+    df['resp_b_len']        = df['response_b'].str.len()
+    df['len_diff']          = df['resp_b_len'] - df['resp_a_len']
+    df['prompt_word_count'] = df['prompt'].str.split().str.len()
+    df['resp_a_word_count'] = df['response_a'].str.split().str.len()
+    df['resp_b_word_count'] = df['response_b'].str.split().str.len()
+    df['word_count_diff']   = df['resp_b_word_count'] - df['resp_a_word_count']
+
+    # LENGTH RATIOS
+    df['resp_a_len_ratio']  = df['resp_a_word_count'] / (df['prompt_word_count'] + 1)
+    df['resp_b_len_ratio']  = df['resp_b_word_count'] / (df['prompt_word_count'] + 1)
+    df['len_ratio_diff']    = df['resp_b_len_ratio'] - df['resp_a_len_ratio']
+    df['len_ratio']         = df['resp_b_len'] / (df['resp_a_len'] + 1)
+    df['word_ratio']        = df['resp_b_word_count'] / (df['resp_a_word_count'] + 1)
+
+    # FORMATTING
+    df['resp_a_bold']       = df['response_a'].str.count(r'\*\*')
+    df['resp_b_bold']       = df['response_b'].str.count(r'\*\*')
+    df['bold_diff']         = df['resp_b_bold'] - df['resp_a_bold']
+    df['resp_a_hash']       = df['response_a'].str.count(r'##')
+    df['resp_b_hash']       = df['response_b'].str.count(r'##')
+    df['hash_diff']         = df['resp_b_hash'] - df['resp_a_hash']
+    df['resp_a_new_line']   = df['response_a'].str.count(r'\n')
+    df['resp_b_new_line']   = df['response_b'].str.count(r'\n')
+    df['new_line_diff']     = df['resp_b_new_line'] - df['resp_a_new_line']
+    df['resp_a_code']       = df['response_a'].str.count(r'`')
+    df['resp_b_code']       = df['response_b'].str.count(r'`')
+    df['code_diff']         = df['resp_b_code'] - df['resp_a_code']
+    df['resp_a_list']       = df['response_a'].str.count(r"(?m)^\s*(?:\d+\.|\-|\*|\+)\s+")
+    df['resp_b_list']       = df['response_b'].str.count(r"(?m)^\s*(?:\d+\.|\-|\*|\+)\s+")
+    df['list_diff']         = df['resp_b_list'] - df['resp_a_list']
+    df['resp_a_excl']       = df['response_a'].str.count(r'!')
+    df['resp_b_excl']       = df['response_b'].str.count(r'!')
+    df['excl_diff']         = df['resp_b_excl'] - df['resp_a_excl']
+    df['resp_a_question']   = df['response_a'].str.count(r'\?')
+    df['resp_b_question']   = df['response_b'].str.count(r'\?')
+    df['question_diff']     = df['resp_b_question'] - df['resp_a_question']
+    df['resp_a_quote']      = df['response_a'].str.count(r'"')
+    df['resp_b_quote']      = df['response_b'].str.count(r'"')
+    df['quote_diff']        = df['resp_b_quote'] - df['resp_a_quote']
+    df['resp_a_sentences']  = df['response_a'].str.count(r'[.!?]')
+    df['resp_b_sentences']  = df['response_b'].str.count(r'[.!?]')
+    df['sentence_diff']     = df['resp_b_sentences'] - df['resp_a_sentences']
+    df['sentence_ratio']    = df['resp_b_sentences'] / (df['resp_a_sentences'] + 1)
+
+    # SENTENCE STRUCTURE
+    stats_a = df['response_a'].apply(sentence_stats)
+    stats_b = df['response_b'].apply(sentence_stats)
+    df['resp_a_sent_count']   = stats_a.apply(lambda x: x[0])
+    df['resp_a_avg_sent_len'] = stats_a.apply(lambda x: x[1])
+    df['resp_a_sent_var']     = stats_a.apply(lambda x: x[2])
+    df['resp_b_sent_count']   = stats_b.apply(lambda x: x[0])
+    df['resp_b_avg_sent_len'] = stats_b.apply(lambda x: x[1])
+    df['resp_b_sent_var']     = stats_b.apply(lambda x: x[2])
+    df['sent_count_diff']     = df['resp_b_sent_count'] - df['resp_a_sent_count']
+    df['avg_sent_len_diff']   = df['resp_b_avg_sent_len'] - df['resp_a_avg_sent_len']
+    df['sent_var_diff']       = df['resp_b_sent_var'] - df['resp_a_sent_var']
+
+    # KEYWORD OVERLAP
+    df['resp_a_overlap'] = df.apply(lambda r: keyword_overlap(r['prompt'], r['response_a']), axis=1)
+    df['resp_b_overlap'] = df.apply(lambda r: keyword_overlap(r['prompt'], r['response_b']), axis=1)
+    df['overlap_diff']   = df['resp_b_overlap'] - df['resp_a_overlap']
+    df['overlap_ratio']  = df['resp_b_overlap'] / (df['resp_a_overlap'] + 0.001)
+
+    # CONFIDENCE
+    df['resp_a_confidence'] = df['response_a'].str.count(CONFIDENCE_RE, flags=re.I)
+    df['resp_b_confidence'] = df['response_b'].str.count(CONFIDENCE_RE, flags=re.I)
+    df['confidence_diff']   = df['resp_b_confidence'] - df['resp_a_confidence']
+
+    # AI IDENTITY
+    df['resp_a_is_ai'] = df['response_a'].str.lower().str.count(r'an ai')
+    df['resp_b_is_ai'] = df['response_b'].str.lower().str.count(r'an ai')
+    df['ai_diff']       = df['resp_b_is_ai'] - df['resp_a_is_ai']
+
+    # LANGUAGE
+    df['a_lang_match']    = (df['prompt_lang'] == df['resp_a_lang']).astype(int)
+    df['b_lang_match']    = (df['prompt_lang'] == df['resp_b_lang']).astype(int)
+    df['lang_match_diff'] = df['b_lang_match'] - df['a_lang_match']
+    df['is_prompt_en']    = (df['prompt_lang'] == 'en').astype(int)
+
+    # LEXICAL DIVERSITY + VOCAB RICHNESS
+    df['resp_a_lexdiv']     = df['response_a'].apply(lexical_diversity)
+    df['resp_b_lexdiv']     = df['response_b'].apply(lexical_diversity)
+    df['lexdiv_diff']       = df['resp_b_lexdiv'] - df['resp_a_lexdiv']
+    df['resp_a_vocab_rich'] = df['response_a'].apply(vocab_richness)
+    df['resp_b_vocab_rich'] = df['response_b'].apply(vocab_richness)
+    df['vocab_rich_diff']   = df['resp_b_vocab_rich'] - df['resp_a_vocab_rich']
+
+    # HEDGE / POLITENESS LEXICONS
+    df['resp_a_hedge']  = df['response_a'].apply(lambda t: count_lexicon(t, HEDGE_LEXICON))
+    df['resp_b_hedge']  = df['response_b'].apply(lambda t: count_lexicon(t, HEDGE_LEXICON))
+    df['hedge_diff']    = df['resp_b_hedge'] - df['resp_a_hedge']
+    df['resp_a_polite'] = df['response_a'].apply(lambda t: count_lexicon(t, POLITENESS_LEXICON))
+    df['resp_b_polite'] = df['response_b'].apply(lambda t: count_lexicon(t, POLITENESS_LEXICON))
+    df['polite_diff']   = df['resp_b_polite'] - df['resp_a_polite']
+
+    # REFUSAL (weighted score)
+    df['resp_a_refusal']     = df['response_a'].apply(refusal_score)
+    df['resp_b_refusal']     = df['response_b'].apply(refusal_score)
+    df['refusal_diff']       = df['resp_b_refusal'] - df['resp_a_refusal']
+    df['resp_a_has_refusal'] = (df['resp_a_refusal'] > 0).astype(int)
+    df['resp_b_has_refusal'] = (df['resp_b_refusal'] > 0).astype(int)
+    df['has_refusal_diff']   = df['resp_b_has_refusal'] - df['resp_a_has_refusal']
+
+    # READABILITY
+    df['resp_a_readability'] = df['response_a'].apply(textstat.flesch_reading_ease)
+    df['resp_b_readability'] = df['response_b'].apply(textstat.flesch_reading_ease)
+    df['readability_diff']   = df['resp_b_readability'] - df['resp_a_readability']
+
+    # SENTIMENT (TextBlob)
+    df['resp_a_sentiment'] = df['response_a'].apply(lambda x: TextBlob(x).sentiment.polarity)
+    df['resp_b_sentiment'] = df['response_b'].apply(lambda x: TextBlob(x).sentiment.polarity)
+    df['sentiment_diff']   = df['resp_b_sentiment'] - df['resp_a_sentiment']
+
+    # SENTIMENT (VADER)
+    prompt_v = df['prompt'].apply(analyzer.polarity_scores)
+    resp_a_v = df['response_a'].apply(analyzer.polarity_scores)
+    resp_b_v = df['response_b'].apply(analyzer.polarity_scores)
+
+    for key in ['neg', 'neu', 'pos', 'compound']:
+        df[f'prompt_{key}']   = prompt_v.apply(lambda x: x[key])
+        df[f'resp_a_{key}']   = resp_a_v.apply(lambda x: x[key])
+        df[f'resp_b_{key}']   = resp_b_v.apply(lambda x: x[key])
+        df[f'{key}_diff']     = df[f'resp_b_{key}'] - df[f'resp_a_{key}']
+
+    # PROMPT FEATURES
+    df['prompt_punct_count']    = df['prompt'].str.count(r'[.,;:!?\-]')
+    df['prompt_punct_per_word'] = df['prompt_punct_count'] / (df['prompt_word_count'] + 1)
+    df['prompt_has_question']   = df['prompt'].str.contains(r'\?').astype(int)
+
+    # INTERACTIONS
+    df['len_x_overlap']   = df['len_ratio'] * df['overlap_ratio']
+    df['len_x_compound']  = df['len_ratio'] * (df['resp_b_compound'] / (df['resp_a_compound'].abs() + 0.001))
+
+    return df
+
+
+print("Engineering train features...")
+train = engineer_all(train)
+print("Engineering test features...")
+test  = engineer_all(test)
+print(f"Feature engineering ✓  (train: {train.shape[1]} cols, test: {test.shape[1]} cols)")
+
+print("Fitting TF-IDF + SVD...")
+all_text = pd.concat([
+    train['response_a'], train['response_b'],
+    test['response_a'],  test['response_b']
+]).astype(str)
+
+# Unigram SVD (50 dims)
+tfidf = TfidfVectorizer(max_features=10000, stop_words='english')
+tfidf.fit(all_text)
+
+svd = TruncatedSVD(n_components=50, random_state=42)
+svd.fit(tfidf.transform(all_text))
+
+svd_cols = [f'svd_diff_{i}' for i in range(50)]
+
+for label, df in [("train", train), ("test", test)]:
+    diff = svd.transform(tfidf.transform(df['response_b'].astype(str))) - \
+           svd.transform(tfidf.transform(df['response_a'].astype(str)))
+    df_svd = pd.DataFrame(diff, columns=svd_cols, index=df.index)
+    if label == "train":
+        train = pd.concat([train, df_svd], axis=1)
+    else:
+        test = pd.concat([test, df_svd], axis=1)
+
+# Bigram SVD (25 dims)
+print("Fitting bigram TF-IDF + SVD...")
+tfidf_bi = TfidfVectorizer(max_features=5000, ngram_range=(2, 2), stop_words='english')
+tfidf_bi.fit(all_text)
+
+svd_bi = TruncatedSVD(n_components=25, random_state=42)
+svd_bi.fit(tfidf_bi.transform(all_text))
+
+bi_cols = [f'bigram_diff_{i}' for i in range(25)]
+
+for label, df in [("train", train), ("test", test)]:
+    diff = svd_bi.transform(tfidf_bi.transform(df['response_b'].astype(str))) - \
+           svd_bi.transform(tfidf_bi.transform(df['response_a'].astype(str)))
+    df_bi = pd.DataFrame(diff, columns=bi_cols, index=df.index)
+    if label == "train":
+        train = pd.concat([train, df_bi], axis=1)
+    else:
+        test = pd.concat([test, df_bi], axis=1)
+
+# Prompt-Response cosine similarity
+print("Computing prompt-response cosine similarities...")
+tfidf_full = TfidfVectorizer(max_features=30000, ngram_range=(1,2), min_df=3, dtype=np.float32)
+tfidf_full.fit(pd.concat([
+    train['prompt'], train['response_a'], train['response_b'],
+    test['prompt'],  test['response_a'],  test['response_b']
+]).astype(str))
+
+from sklearn.preprocessing import normalize as sk_normalize
+
+for label, df in [("train", train), ("test", test)]:
+    P = sk_normalize(tfidf_full.transform(df['prompt'].astype(str)))
+    A = sk_normalize(tfidf_full.transform(df['response_a'].astype(str)))
+    B = sk_normalize(tfidf_full.transform(df['response_b'].astype(str)))
+
+    df['tf_sim_a']    = np.asarray(P.multiply(A).sum(axis=1)).reshape(-1)
+    df['tf_sim_b']    = np.asarray(P.multiply(B).sum(axis=1)).reshape(-1)
+    df['tf_sim_diff'] = df['tf_sim_b'] - df['tf_sim_a']
+
+# Response similarity (A vs B)
+print("Computing response A-B similarity...")
+for label, df in [("train", train), ("test", test)]:
+    ta = tfidf.transform(df['response_a'].astype(str))
+    tb = tfidf.transform(df['response_b'].astype(str))
+    df['resp_similarity'] = np.array([cos_sim(a, b)[0][0] for a, b in zip(ta, tb)])
+
+print("TF-IDF features ✓")
+
+feature_cols = [
+    # Length
+    'resp_a_len', 'resp_b_len', 'len_diff',
+    'resp_a_word_count', 'resp_b_word_count', 'word_count_diff',
+    'prompt_word_count', 'prompt_len',
+    'resp_a_len_ratio', 'resp_b_len_ratio', 'len_ratio_diff',
+    'len_ratio', 'word_ratio',
+
+    # Formatting — strongest signals (64%, 63%, 62%)
+    'resp_a_bold', 'resp_b_bold', 'bold_diff',
+    'resp_a_hash', 'resp_b_hash', 'hash_diff',
+    'resp_a_new_line', 'resp_b_new_line', 'new_line_diff',
+    'resp_a_code', 'resp_b_code', 'code_diff',
+    'resp_a_list', 'resp_b_list', 'list_diff',
+    'resp_a_excl', 'resp_b_excl', 'excl_diff',
+    'resp_a_question', 'resp_b_question', 'question_diff',
+    'resp_a_quote', 'resp_b_quote', 'quote_diff',
+    'resp_a_sentences', 'resp_b_sentences', 'sentence_diff', 'sentence_ratio',
+
+    # Sentence structure
+    'resp_a_sent_count', 'resp_b_sent_count', 'sent_count_diff',
+    'resp_a_avg_sent_len', 'resp_b_avg_sent_len', 'avg_sent_len_diff',
+    'resp_a_sent_var', 'resp_b_sent_var', 'sent_var_diff',
+
+    # Overlap + confidence
+    'resp_a_overlap', 'resp_b_overlap', 'overlap_diff', 'overlap_ratio',
+    'resp_a_confidence', 'resp_b_confidence', 'confidence_diff',
+
+    # AI identity + refusal (strong inverse signals)
+    'resp_a_is_ai', 'resp_b_is_ai', 'ai_diff',
+    'resp_a_refusal', 'resp_b_refusal', 'refusal_diff',
+    'resp_a_has_refusal', 'resp_b_has_refusal', 'has_refusal_diff',
+
+    # Lexical / vocab (inverse signals — model learns the direction)
+    'resp_a_lexdiv', 'resp_b_lexdiv', 'lexdiv_diff',
+    'resp_a_vocab_rich', 'resp_b_vocab_rich', 'vocab_rich_diff',
+
+    # Hedge + politeness
+    'resp_a_hedge', 'resp_b_hedge', 'hedge_diff',
+    'resp_a_polite', 'resp_b_polite', 'polite_diff',
+
+    # Readability
+    'resp_a_readability', 'resp_b_readability', 'readability_diff',
+
+    # Sentiment (TextBlob + VADER compound — the ones that matter)
+    'resp_a_sentiment', 'resp_b_sentiment', 'sentiment_diff',
+    'prompt_compound', 'resp_a_compound', 'resp_b_compound', 'compound_diff',
+    'prompt_neg', 'resp_a_neg', 'resp_b_neg', 'neg_diff',
+    'prompt_pos', 'resp_a_pos', 'resp_b_pos', 'pos_diff',
+    'prompt_neu', 'resp_a_neu', 'resp_b_neu', 'neu_diff',
+
+    # Language
+    'is_prompt_en', 'a_lang_match', 'b_lang_match', 'lang_match_diff',
+
+    # Prompt
+    'prompt_punct_per_word', 'prompt_has_question',
+
+    # Interactions
+    'len_x_overlap', 'len_x_compound',
+
+    # TF-IDF cosine
+    'tf_sim_a', 'tf_sim_b', 'tf_sim_diff',
+    'resp_similarity',
+] + svd_cols + bi_cols
+
+# Verify all columns exist
+missing = [c for c in feature_cols if c not in train.columns]
+if missing:
+    print(f"WARNING — missing columns: {missing}")
+    feature_cols = [c for c in feature_cols if c in train.columns]
+
+print(f"Feature count: {len(feature_cols)}")
+
+SEP  = "═" * 72
+THIN = "─" * 72
+def pct(v): return f"{v:.1%}"
+def pval_flag(p):
+    if p < 0.001: return "***"
+    if p < 0.01:  return "**"
+    if p < 0.05:  return "*"
+    return "ns"
+
+# Feature win rate table
+print(f"\n{SEP}")
+print(f"  FEATURE WIN RATES  (side with MORE of X → win rate)")
+print(SEP)
+
+feature_pairs = [
+    ("Char Length",         "resp_a_len",           "resp_b_len"),
+    ("Word Count",          "resp_a_word_count",    "resp_b_word_count"),
+    ("Bold (**)",           "resp_a_bold",          "resp_b_bold"),
+    ("Headers (##)",        "resp_a_hash",          "resp_b_hash"),
+    ("Line Breaks",         "resp_a_new_line",      "resp_b_new_line"),
+    ("Code (`)",            "resp_a_code",          "resp_b_code"),
+    ("Lists",               "resp_a_list",          "resp_b_list"),
+    ("Exclamation (!)",     "resp_a_excl",          "resp_b_excl"),
+    ("Question (?)",        "resp_a_question",      "resp_b_question"),
+    ("Quotes",              "resp_a_quote",         "resp_b_quote"),
+    ("Sentence Count",      "resp_a_sentences",     "resp_b_sentences"),
+    ("Sent Struct Count",   "resp_a_sent_count",    "resp_b_sent_count"),
+    ("Avg Sentence Len",    "resp_a_avg_sent_len",  "resp_b_avg_sent_len"),
+    ("Sentence Variance",   "resp_a_sent_var",      "resp_b_sent_var"),
+    ("Prompt Overlap",      "resp_a_overlap",       "resp_b_overlap"),
+    ("Confidence Words",    "resp_a_confidence",    "resp_b_confidence"),
+    ("AI Identity",         "resp_a_is_ai",         "resp_b_is_ai"),
+    ("Lexical Diversity",   "resp_a_lexdiv",        "resp_b_lexdiv"),
+    ("Vocab Richness",      "resp_a_vocab_rich",    "resp_b_vocab_rich"),
+    ("Hedge Words",         "resp_a_hedge",         "resp_b_hedge"),
+    ("Politeness Words",    "resp_a_polite",        "resp_b_polite"),
+    ("Refusal (weighted)",  "resp_a_refusal",       "resp_b_refusal"),
+    ("Readability",         "resp_a_readability",   "resp_b_readability"),
+    ("Sentiment (TextBlob)","resp_a_sentiment",     "resp_b_sentiment"),
+    ("VADER Compound",      "resp_a_compound",      "resp_b_compound"),
+    ("VADER Positive",      "resp_a_pos",           "resp_b_pos"),
+    ("VADER Negative",      "resp_a_neg",           "resp_b_neg"),
+    ("VADER Neutral",       "resp_a_neu",           "resp_b_neu"),
+    ("Lang Match",          "a_lang_match",         "b_lang_match"),
+    ("TF-IDF Prompt Sim",   "tf_sim_a",             "tf_sim_b"),
+]
+
+nt_df = train[train['winner'] != 'Tie']
+rows_csv = []
+
+print(f"  {'Feature':<22} {'More→Wins':>10} {'Less→Wins':>10} {'p-value':>12} {'Sig':>4} {'n':>7}")
+print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*12} {'─'*4} {'─'*7}")
+
+for label, col_a, col_b in feature_pairs:
+    if col_a not in nt_df.columns:
+        continue
+    more = np.where(nt_df[col_a] > nt_df[col_b], 'A',
+           np.where(nt_df[col_b] > nt_df[col_a], 'B', 'Equal'))
+    mask = more != 'Equal'
+    ne   = nt_df[mask]
+    m    = more[mask]
+    if len(ne) < 10:
+        continue
+    wins = ((m == 'A') & (ne['winner'].values == 'A')) | \
+           ((m == 'B') & (ne['winner'].values == 'B'))
+    k       = wins.sum()
+    n_total = len(ne)
+    bt      = binomtest(k, n=n_total, p=0.5)
+    wr      = k / n_total
+
+    print(f"  {label:<22} {pct(wr):>10} {pct(1-wr):>10} {bt.pvalue:>12.2e} {pval_flag(bt.pvalue):>4} {n_total:>7,}")
+    rows_csv.append({
+        'feature':     label,
+        'more_wins':   round(wr, 4),
+        'less_wins':   round(1 - wr, 4),
+        'p_value':     bt.pvalue,
+        'significant': pval_flag(bt.pvalue),
+        'n':           n_total,
+        'direction':   'more_wins' if wr > 0.5 else 'less_wins'
+    })
+
+# Save CSV — sorted by more_wins descending for export
+results_df = pd.DataFrame(rows_csv).sort_values('more_wins', ascending=False)
+results_df.to_csv('/content/feature_win_rates.csv', index=False)
+print(f"\n  Saved → /content/feature_win_rates.csv")
+
+# Summary: strongest signals in each direction
+sig_df        = results_df[results_df['significant'] != 'ns']
+positive_df   = sig_df[sig_df['direction'] == 'more_wins'].sort_values('more_wins', ascending=False)
+inverse_df    = sig_df[sig_df['direction'] == 'less_wins'].sort_values('more_wins', ascending=True)  # lowest more_wins = strongest inverse
+
+print(f"\n{THIN}")
+print(f"  TOP 5 STRONGEST 'MORE → WINS':")
+for _, r in positive_df.head(5).iterrows():
+    print(f"    {r['feature']:<22}  more wins {r['more_wins']:.1%}")
+
+print(f"\n  TOP 5 STRONGEST 'LESS → WINS' (inverse signals):")
+for _, r in inverse_df.head(5).iterrows():
+    print(f"    {r['feature']:<22}  less wins {r['less_wins']:.1%}")
+
+print(f"\n{THIN}")
+print(f"  NON-SIGNIFICANT FEATURES (p >= 0.05):")
+for _, r in results_df[results_df['significant'] == 'ns'].iterrows():
+    print(f"    {r['feature']:<22}  more wins {r['more_wins']:.1%}  (p={r['p_value']:.3f})")
+print(THIN)
+
+le = LabelEncoder()
+X = train[feature_cols].values.astype(np.float32)
+y = le.fit_transform(train['winner'])
+X_test = test[feature_cols].values.astype(np.float32)
+
+X_train, X_valid, y_train, y_valid = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"X_train: {X_train.shape}  X_valid: {X_valid.shape}  X_test: {X_test.shape}")
+print(f"Classes: {le.classes_}  →  {dict(zip(le.classes_, range(len(le.classes_))))}")
+
+print("Training baseline models...")
+
+models = {
+    'XGBoost': XGBClassifier(
+        objective='multi:softprob', n_estimators=500,
+        learning_rate=0.05, max_depth=6, subsample=0.9,
+        colsample_bytree=0.9, reg_lambda=1.0,
+        tree_method='hist', random_state=42,
+        early_stopping_rounds=50
+    ),
+    'LightGBM': LGBMClassifier(
+        n_estimators=500, learning_rate=0.05, max_depth=8,
+        random_state=42, verbose=-1
+    ),
+    'CatBoost': CatBoostClassifier(
+        iterations=500, learning_rate=0.05,
+        depth=6, random_state=42, verbose=0,
+        early_stopping_rounds=50
+    ),
+}
+
+results = {}
+for name, m in models.items():
+    t0 = time.time()
+    if name == 'CatBoost':
+        m.fit(X_train, y_train, eval_set=(X_valid, y_valid))
+    elif name == 'LightGBM':
+        m.fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
+    else:
+        m.fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
+    elapsed = time.time() - t0
+
+    probs = m.predict_proba(X_valid)
+    acc   = accuracy_score(y_valid, m.predict(X_valid))
+    ll    = log_loss(y_valid, probs)
+    results[name] = {'probs': probs, 'acc': acc, 'logloss': ll, 'model': m}
+    print(f"  {name:>10}:  logloss={ll:.4f}  acc={acc:.4f}  ({elapsed:.1f}s)")
+
+# Quick ensemble
+avg_probs = np.mean([r['probs'] for r in results.values()], axis=0)
+print(f"\n  {'avg ensemble':>10}:  logloss={log_loss(y_valid, avg_probs):.4f}")
+
+w = {'XGBoost': 0.20, 'LightGBM': 0.50, 'CatBoost': 0.30}
+weighted = sum(w[n] * results[n]['probs'] for n in results)
+print(f"  {'wt ensemble':>10}:  logloss={log_loss(y_valid, weighted):.4f}")
+
+# Bridge
+final_model = results['LightGBM']['model']
+print(f"final_model: {type(final_model)}")
+print(f"feature_cols: {len(feature_cols)} features")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from sklearn.metrics import confusion_matrix
+
+plt.rcParams.update({
+    'font.family': 'serif', 'font.size': 11,
+    'axes.titlesize': 12, 'axes.labelsize': 11,
+    'xtick.labelsize': 10, 'ytick.labelsize': 10,
+    'axes.spines.top': False, 'axes.spines.right': False,
+    'figure.dpi': 150, 'savefig.dpi': 300,
+    'savefig.bbox': 'tight', 'savefig.pad_inches': 0.15,
+})
+
+BLUE = "#2C6FAC"
+RED  = "#C0392B"
+
+# Fig 1: Win Rates
+def plot_win_rates(results_df, save_path="/content/fig1_win_rates.png"):
+    df = results_df[results_df['significant'] != 'ns'].copy()
+    df = df.sort_values('more_wins', ascending=True)
+    colors = [RED if r < 0.5 else BLUE for r in df['more_wins']]
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    bars = ax.barh(df['feature'], df['more_wins'] * 100,
+                   color=colors, edgecolor='white', linewidth=0.5, height=0.65)
+    ax.axvline(50, color='black', linewidth=1.2, linestyle='--', alpha=0.6, zorder=3)
+    ax.text(50.4, -0.8, '50% (chance)', fontsize=9, color='#555555', va='top')
+
+    for bar, val in zip(bars, df['more_wins']):
+        x = bar.get_width()
+        offset = 0.5 if val >= 0.5 else -0.5
+        ha = 'left' if val >= 0.5 else 'right'
+        ax.text(x + offset, bar.get_y() + bar.get_height() / 2,
+                f'{val*100:.1f}%', va='center', ha=ha, fontsize=8.5)
+
+    ax.set_xlabel('Win Rate (%) — Side with More of Feature', labelpad=8)
+    ax.set_xlim(25, 70)
+    ax.set_xticks([30, 40, 50, 60, 70])
+    ax.set_xticklabels(['30%', '40%', '50%', '60%', '70%'])
+    ax.legend(handles=[
+        mpatches.Patch(color=BLUE, label='Positive predictor (more → wins)'),
+        mpatches.Patch(color=RED,  label='Inverse predictor (more → loses)'),
+    ], loc='lower right', fontsize=9, framealpha=0.9, edgecolor='#CCCCCC')
+    ax.set_title('Fig. 1 — Feature Win Rates for Significant Predictors\n'
+                 '(binomial test vs. p = 0.5, non-tied comparisons only)',
+                 fontsize=11, pad=12)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved → {save_path}")
+
+
+# Fig 2: Feature Importance
+def plot_feature_importance(final_model, feature_cols, top_n=20,
+                             save_path="/content/fig2_feature_importance.png"):
+    importances = final_model.feature_importances_
+    feat_imp = pd.Series(importances, index=feature_cols).sort_values(ascending=False)
+    top = feat_imp.head(top_n).sort_values(ascending=True)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    bars = ax.barh(top.index, top.values, color="#8E44AD",
+                   edgecolor='white', linewidth=0.5, height=0.65)
+
+    max_val = top.values.max()
+    for bar in bars:
+        w = bar.get_width()
+        ax.text(w + max_val * 0.01, bar.get_y() + bar.get_height() / 2,
+                f'{w:,.0f}', va='center', ha='left', fontsize=8.5)
+
+    ax.set_xlabel('Feature Importance (Gain)', labelpad=8)
+    ax.set_xlim(0, max_val * 1.15)
+    ax.set_title(f'Fig. 2 — Top {top_n} Feature Importances by Gain\n'
+                 '(LightGBM, tuned hyperparameters, retrained on full dataset)',
+                 fontsize=11, pad=12)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved → {save_path}")
+
+
+# Fig 3: Confusion Matrix
+def plot_confusion_matrix(model, X_valid, y_valid, le,
+                           save_path="/content/fig3_confusion_matrix.png"):
+    y_pred = model.predict(X_valid)
+    cm = confusion_matrix(y_valid, y_pred)
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+    class_names = le.classes_
+    n = len(class_names)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5),
+                              gridspec_kw={'width_ratios': [1, 1], 'wspace': 0.35})
+    for ax, data, title, fmt in zip(
+        axes,
+        [cm, cm_norm],
+        ['(a) Raw Counts', '(b) Row-Normalized (Recall per Class)'],
+        [lambda v: f'{v:,}', lambda v: f'{v:.2f}']
+    ):
+        im = ax.imshow(data, interpolation='nearest', cmap='Blues',
+                       vmin=0, vmax=(None if data is cm else 1))
+        ax.set_title(title, fontsize=11, pad=10)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        thresh = data.max() * 0.6
+        for i in range(n):
+            for j in range(n):
+                ax.text(j, i, fmt(data[i, j]), ha='center', va='center',
+                        fontsize=11, color='white' if data[i, j] > thresh else 'black')
+        ax.set_xticks(range(n)); ax.set_yticks(range(n))
+        ax.set_xticklabels([f'Pred {c}' for c in class_names])
+        ax.set_yticklabels([f'True {c}' for c in class_names])
+        ax.set_xlabel('Predicted Label', labelpad=8)
+        ax.set_ylabel('True Label', labelpad=8)
+
+    fig.suptitle('Fig. 3 — Confusion Matrix on Held-Out Validation Set\n'
+                 f'(n = {len(y_valid):,}  |  LightGBM tuned params)',
+                 fontsize=11, y=1.02)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved → {save_path}")
+
+# Save them
+plot_win_rates(results_df)
+plot_feature_importance(final_model, feature_cols, top_n=20)
+plot_confusion_matrix(final_model, X_valid, y_valid, le)
+print("\nAll figures saved.")
