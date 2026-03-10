@@ -1,4 +1,4 @@
-!pip install textstat textblob nltk langdetect xgboost lightgbm catboost optuna -q
+!pip install textstat textblob nltk langdetect xgboost lightgbm catboost -q
 
 !python -m textblob.download_corpora lite
 
@@ -18,18 +18,23 @@ from textblob import TextBlob
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 42
 
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_predict
 from sklearn.metrics import log_loss, accuracy_score
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics.pairwise import cosine_similarity as cos_sim
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix
 
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
-import optuna
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 train = pd.read_csv('/content/train.csv')
 test  = pd.read_csv('/content/test.csv')
@@ -270,6 +275,35 @@ def engineer_all(df):
         df[f'resp_b_{key}']   = resp_b_v.apply(lambda x: x[key])
         df[f'{key}_diff']     = df[f'resp_b_{key}'] - df[f'resp_a_{key}']
 
+    # Absolute differences (alignment strength): response vs prompt
+    df['prompt_a_neg_diff']      = df['resp_a_neg']      - df['prompt_neg']
+    df['prompt_a_neu_diff']      = df['resp_a_neu']      - df['prompt_neu']
+    df['prompt_a_pos_diff']      = df['resp_a_pos']      - df['prompt_pos']
+    df['prompt_a_compound_diff'] = df['resp_a_compound'] - df['prompt_compound']
+
+    df['prompt_b_neg_diff']      = df['resp_b_neg']      - df['prompt_neg']
+    df['prompt_b_neu_diff']      = df['resp_b_neu']      - df['prompt_neu']
+    df['prompt_b_pos_diff']      = df['resp_b_pos']      - df['prompt_pos']
+    df['prompt_b_compound_diff'] = df['resp_b_compound'] - df['prompt_compound']
+
+    # Absolute alignment magnitudes + B-vs-A alignment comparison
+    df['prompt_a_compound_abs']  = df['prompt_a_compound_diff'].abs()
+    df['prompt_b_compound_abs']  = df['prompt_b_compound_diff'].abs()
+    df['prompt_compound_abs_diff'] = df['prompt_b_compound_abs'] - df['prompt_a_compound_abs']
+
+    # Relative alignment (smaller abs diff = better alignment; sign indicates which is closer)
+    df['prompt_compound_alignment_diff'] = (
+        df['prompt_b_compound_diff'].abs() - df['prompt_a_compound_diff'].abs()
+    )
+
+    eps = 1e-6
+
+    # Response B-to-A sentiment ratios (stable eps, not +1)
+    df['neg_ratio']      = df['resp_b_neg']      / (df['resp_a_neg']      + eps)
+    df['neu_ratio']      = df['resp_b_neu']      / (df['resp_a_neu']      + eps)
+    df['pos_ratio']      = df['resp_b_pos']      / (df['resp_a_pos']      + eps)
+    df['compound_ratio'] = df['resp_b_compound'] / (df['resp_a_compound'] + eps)
+
     # PROMPT FEATURES
     df['prompt_punct_count']    = df['prompt'].str.count(r'[.,;:!?\-]')
     df['prompt_punct_per_word'] = df['prompt_punct_count'] / (df['prompt_word_count'] + 1)
@@ -409,6 +443,17 @@ feature_cols = [
     'prompt_neg', 'resp_a_neg', 'resp_b_neg', 'neg_diff',
     'prompt_pos', 'resp_a_pos', 'resp_b_pos', 'pos_diff',
     'prompt_neu', 'resp_a_neu', 'resp_b_neu', 'neu_diff',
+
+    # Prompt / response alignment diffs
+    'prompt_a_neg_diff', 'prompt_a_neu_diff', 'prompt_a_pos_diff', 'prompt_a_compound_diff',
+    'prompt_b_neg_diff', 'prompt_b_neu_diff', 'prompt_b_pos_diff', 'prompt_b_compound_diff',
+
+    # Alignment magnitude / comparison
+    'prompt_a_compound_abs', 'prompt_b_compound_abs',
+    'prompt_compound_abs_diff', 'prompt_compound_alignment_diff',
+
+    # Sentiment ratios (B vs A)
+    'neg_ratio', 'neu_ratio', 'pos_ratio', 'compound_ratio',
 
     # Language
     'is_prompt_en', 'a_lang_match', 'b_lang_match', 'lang_match_diff',
@@ -569,17 +614,31 @@ models = {
         depth=6, random_state=42, verbose=0,
         early_stopping_rounds=50
     ),
+    'LogReg': Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),
+        ('clf', LogisticRegression(
+            multi_class='multinomial',
+            solver='saga',
+            C=1.0,
+            max_iter=3000,
+            n_jobs=-1,
+            random_state=42
+        ))
+    ])
 }
 
 results = {}
 for name, m in models.items():
     t0 = time.time()
+
     if name == 'CatBoost':
         m.fit(X_train, y_train, eval_set=(X_valid, y_valid))
-    elif name == 'LightGBM':
+    elif name in ['LightGBM', 'XGBoost']:
         m.fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
     else:
-        m.fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
+        m.fit(X_train, y_train)
+
     elapsed = time.time() - t0
 
     probs = m.predict_proba(X_valid)
@@ -593,19 +652,50 @@ avg_probs = np.mean([r['probs'] for r in results.values()], axis=0)
 print(f"\n  {'avg ensemble':>10}:  logloss={log_loss(y_valid, avg_probs):.4f}")
 
 w = {'XGBoost': 0.20, 'LightGBM': 0.50, 'CatBoost': 0.30}
-weighted = sum(w[n] * results[n]['probs'] for n in results)
+weighted = sum(w[name] * results[name]['probs'] for name in w.keys())
 print(f"  {'wt ensemble':>10}:  logloss={log_loss(y_valid, weighted):.4f}")
 
+# Top Positive / Negative Featuers Per Class by LogReg
+
+logreg_model = results['LogReg']['model']
+
+clf = logreg_model.named_steps['clf']
+feature_names = feature_cols
+
+coef = clf.coef_
+classes = clf.classes_
+
+coef_df = pd.DataFrame(coef, columns=feature_names, index=le.classes_)
+coef_df.head()
+
+def show_top_features(class_label, top_n=15):
+    coefs = coef_df.loc[class_label].sort_values()
+
+    print(f"\nTop {top_n} features pushing TOWARD {class_label}:")
+    print(coefs.tail(top_n)[::-1])
+
+    print(f"\nTop {top_n} features pushing AWAY from {class_label}:")
+    print(coefs.head(top_n))
+
+def plot_logreg_top(class_label, top_n=15):
+    coefs = coef_df.loc[class_label]
+    top = coefs.abs().sort_values(ascending=False).head(top_n).index
+    values = coefs[top].sort_values()
+
+    plt.figure(figsize=(8,6))
+    values.plot(kind='barh')
+    plt.title(f'LogReg Coefficients — Class {class_label}')
+    plt.axvline(0, color='black')
+    plt.tight_layout()
+    plt.show()
+
+plot_logreg_top('A')
+plot_logreg_top('B')
+
 # Bridge
-final_model = results['LightGBM']['model']
+final_model = results['XGBoost']['model']
 print(f"final_model: {type(final_model)}")
 print(f"feature_cols: {len(feature_cols)} features")
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from sklearn.metrics import confusion_matrix
 
 plt.rcParams.update({
     'font.family': 'serif', 'font.size': 11,
