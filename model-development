@@ -275,35 +275,6 @@ def engineer_all(df):
         df[f'resp_b_{key}']   = resp_b_v.apply(lambda x: x[key])
         df[f'{key}_diff']     = df[f'resp_b_{key}'] - df[f'resp_a_{key}']
 
-    # Absolute differences (alignment strength): response vs prompt
-    df['prompt_a_neg_diff']      = df['resp_a_neg']      - df['prompt_neg']
-    df['prompt_a_neu_diff']      = df['resp_a_neu']      - df['prompt_neu']
-    df['prompt_a_pos_diff']      = df['resp_a_pos']      - df['prompt_pos']
-    df['prompt_a_compound_diff'] = df['resp_a_compound'] - df['prompt_compound']
-
-    df['prompt_b_neg_diff']      = df['resp_b_neg']      - df['prompt_neg']
-    df['prompt_b_neu_diff']      = df['resp_b_neu']      - df['prompt_neu']
-    df['prompt_b_pos_diff']      = df['resp_b_pos']      - df['prompt_pos']
-    df['prompt_b_compound_diff'] = df['resp_b_compound'] - df['prompt_compound']
-
-    # Absolute alignment magnitudes + B-vs-A alignment comparison
-    df['prompt_a_compound_abs']  = df['prompt_a_compound_diff'].abs()
-    df['prompt_b_compound_abs']  = df['prompt_b_compound_diff'].abs()
-    df['prompt_compound_abs_diff'] = df['prompt_b_compound_abs'] - df['prompt_a_compound_abs']
-
-    # Relative alignment (smaller abs diff = better alignment; sign indicates which is closer)
-    df['prompt_compound_alignment_diff'] = (
-        df['prompt_b_compound_diff'].abs() - df['prompt_a_compound_diff'].abs()
-    )
-
-    eps = 1e-6
-
-    # Response B-to-A sentiment ratios (stable eps, not +1)
-    df['neg_ratio']      = df['resp_b_neg']      / (df['resp_a_neg']      + eps)
-    df['neu_ratio']      = df['resp_b_neu']      / (df['resp_a_neu']      + eps)
-    df['pos_ratio']      = df['resp_b_pos']      / (df['resp_a_pos']      + eps)
-    df['compound_ratio'] = df['resp_b_compound'] / (df['resp_a_compound'] + eps)
-
     # PROMPT FEATURES
     df['prompt_punct_count']    = df['prompt'].str.count(r'[.,;:!?\-]')
     df['prompt_punct_per_word'] = df['prompt_punct_count'] / (df['prompt_word_count'] + 1)
@@ -443,17 +414,6 @@ feature_cols = [
     'prompt_neg', 'resp_a_neg', 'resp_b_neg', 'neg_diff',
     'prompt_pos', 'resp_a_pos', 'resp_b_pos', 'pos_diff',
     'prompt_neu', 'resp_a_neu', 'resp_b_neu', 'neu_diff',
-
-    # Prompt / response alignment diffs
-    'prompt_a_neg_diff', 'prompt_a_neu_diff', 'prompt_a_pos_diff', 'prompt_a_compound_diff',
-    'prompt_b_neg_diff', 'prompt_b_neu_diff', 'prompt_b_pos_diff', 'prompt_b_compound_diff',
-
-    # Alignment magnitude / comparison
-    'prompt_a_compound_abs', 'prompt_b_compound_abs',
-    'prompt_compound_abs_diff', 'prompt_compound_alignment_diff',
-
-    # Sentiment ratios (B vs A)
-    'neg_ratio', 'neu_ratio', 'pos_ratio', 'compound_ratio',
 
     # Language
     'is_prompt_en', 'a_lang_match', 'b_lang_match', 'lang_match_diff',
@@ -744,34 +704,39 @@ def plot_win_rates(results_df, save_path="/content/fig1_win_rates.png"):
     plt.close()
     print(f"Saved → {save_path}")
 
-
 # Fig 2: Feature Importance
 def plot_feature_importance(final_model, feature_cols, top_n=20,
                              save_path="/content/fig2_feature_importance.png"):
-    importances = final_model.feature_importances_
+    booster = final_model.get_booster()
+    score = booster.get_score(importance_type='gain')  # keys like "f0", "f1", ...
+    importances = np.zeros(len(feature_cols), dtype=float)
+    for k, v in score.items():
+        idx = int(k[1:])  # "f12" -> 12
+        if 0 <= idx < len(importances):
+            importances[idx] = v
+
     feat_imp = pd.Series(importances, index=feature_cols).sort_values(ascending=False)
     top = feat_imp.head(top_n).sort_values(ascending=True)
 
     fig, ax = plt.subplots(figsize=(8, 7))
-    bars = ax.barh(top.index, top.values, color="#8E44AD",
-                   edgecolor='white', linewidth=0.5, height=0.65)
+    bars = ax.barh(top.index, top.values,
+                   color="#8E44AD", edgecolor='white', linewidth=0.5, height=0.65)
 
-    max_val = top.values.max()
+    max_val = top.values.max() if len(top) else 1.0
     for bar in bars:
         w = bar.get_width()
         ax.text(w + max_val * 0.01, bar.get_y() + bar.get_height() / 2,
-                f'{w:,.0f}', va='center', ha='left', fontsize=8.5)
+                f'{w:,.2f}', va='center', ha='left', fontsize=8.5)
 
     ax.set_xlabel('Feature Importance (Gain)', labelpad=8)
     ax.set_xlim(0, max_val * 1.15)
     ax.set_title(f'Fig. 2 — Top {top_n} Feature Importances by Gain\n'
-                 '(LightGBM, tuned hyperparameters, retrained on full dataset)',
+                 '(XGBoost, trained on engineered features)',
                  fontsize=11, pad=12)
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
     print(f"Saved → {save_path}")
-
 
 # Fig 3: Confusion Matrix
 def plot_confusion_matrix(model, X_valid, y_valid, le,
