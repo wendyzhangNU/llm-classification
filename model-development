@@ -141,9 +141,7 @@ CONFIDENCE_RE = r"\b(will|must|always|never|definitely)\b"
 
 analyzer = SentimentIntensityAnalyzer()
 
-
 def engineer_all(df):
-    """All features from both notebooks in one pass."""
     df = df.copy()
     for col in ['prompt', 'response_a', 'response_b']:
         df[col] = df[col].fillna("").astype(str)
@@ -704,6 +702,7 @@ def plot_win_rates(results_df, save_path="/content/fig1_win_rates.png"):
     plt.close()
     print(f"Saved → {save_path}")
 
+
 # Fig 2: Feature Importance
 def plot_feature_importance(final_model, feature_cols, top_n=20,
                              save_path="/content/fig2_feature_importance.png"):
@@ -737,6 +736,7 @@ def plot_feature_importance(final_model, feature_cols, top_n=20,
     plt.savefig(save_path)
     plt.close()
     print(f"Saved → {save_path}")
+
 
 # Fig 3: Confusion Matrix
 def plot_confusion_matrix(model, X_valid, y_valid, le,
