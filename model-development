@@ -771,7 +771,7 @@ def plot_confusion_matrix(model, X_valid, y_valid, le,
         ax.set_ylabel('True Label', labelpad=8)
 
     fig.suptitle('Fig. 3 — Confusion Matrix on Held-Out Validation Set\n'
-                 f'(n = {len(y_valid):,}  |  LightGBM tuned params)',
+                 f'(n = {len(y_valid):,}  |  XGBoost tuned params)',
                  fontsize=11, y=1.02)
     plt.tight_layout()
     plt.savefig(save_path)
