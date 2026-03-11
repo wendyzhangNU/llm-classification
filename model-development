@@ -1,3 +1,4 @@
+# For Kaggle/offline, remove pip and download
 !pip install textstat textblob nltk langdetect xgboost lightgbm catboost -q
 !python -m textblob.download_corpora lite
 
@@ -5,17 +6,17 @@ import json
 import re
 import time
 import warnings
+import random
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import nltk
 import numpy as np
 import pandas as pd
-import textstat
 from catboost import CatBoostClassifier
-from langdetect import DetectorFactory, detect
 from lightgbm import LGBMClassifier
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from scipy.optimize import minimize
 from scipy.stats import binomtest, mannwhitneyu
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -32,10 +33,29 @@ from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
 nltk.download("vader_lexicon", quiet=True)
-DetectorFactory.seed = 42
 
+# langdetect + textstat (wrapped in try)
+HAS_LANGDETECT = False
+HAS_TEXTSTAT = False
+
+try:
+    from langdetect import detect, DetectorFactory
+    DetectorFactory.seed = 42
+    HAS_LANGDETECT = True
+except Exception as e:
+    print("[INFO] langdetect unavailable; language features will be zero-filled.")
+    HAS_LANGDETECT = False
+
+try:
+    import textstat
+    HAS_TEXTSTAT = True
+except Exception as e:
+    print("[INFO] textstat unavailable; readability features will be zero-filled.")
+    HAS_TEXTSTAT = False
+
+# Data loading
 train = pd.read_csv("/content/train.csv")
-test = pd.read_csv("/content/test.csv")
+test  = pd.read_csv("/content/test.csv")
 
 
 def parse_response(resp):
@@ -64,51 +84,53 @@ print(
     f"Ties: {(train['winner']=='Tie').sum():,}"
 )
 
-
+# Optional language detection helpers
 def safe_detect(text):
+    if not HAS_LANGDETECT:
+        return "unknown"
     try:
         return detect(str(text)[:5000])
     except Exception:
         return "unknown"
 
+if HAS_LANGDETECT:
+    for label, df in (("Train", train), ("Test", test)):
+        print(f"Detecting languages for {label}...")
+        df["prompt_lang"] = df["prompt"].apply(safe_detect)
+        df["resp_a_lang"] = df["response_a"].apply(safe_detect)
+        df["resp_b_lang"] = df["response_b"].apply(safe_detect)
+    print("Language detection ✓")
+else:
+    # create placeholder columns
+    for df in (train, test):
+        df["prompt_lang"] = "unknown"
+        df["resp_a_lang"] = "unknown"
+        df["resp_b_lang"] = "unknown"
 
-for label, df in (("Train", train), ("Test", test)):
-    print(f"Detecting languages for {label}...")
-    df["prompt_lang"] = df["prompt"].apply(safe_detect)
-    df["resp_a_lang"] = df["response_a"].apply(safe_detect)
-    df["resp_b_lang"] = df["response_b"].apply(safe_detect)
-
-print("Language detection ✓")
-
+# Text feature helpers
 _word_re = re.compile(r"[A-Za-z']+")
-
 
 def tokenize(text):
     if not isinstance(text, str):
         return []
     return _word_re.findall(text.lower())
 
-
 def lexical_diversity(text):
     toks = tokenize(text)
     return len(set(toks)) / len(toks) if toks else 0.0
-
 
 def count_lexicon(text, lexicon):
     s = set(lexicon)
     return sum(1 for t in tokenize(text) if t in s)
 
-
 def vocab_richness(text):
     words = str(text).lower().split()
     return len(set(words)) / len(words) if words else 0.0
-
 
 def keyword_overlap(prompt, response):
     p = set(str(prompt).lower().split())
     r = set(str(response).lower().split())
     return len(p & r) / len(p) if p else 0.0
-
 
 def refusal_score(text):
     text = str(text).lower()
@@ -141,7 +163,6 @@ def refusal_score(text):
         score += text.count(phrase) * 1
     return score
 
-
 def sentence_stats(text):
     sentences = re.split(r"[.!?]+", str(text))
     sentences = [s.strip() for s in sentences if s.strip()]
@@ -150,53 +171,29 @@ def sentence_stats(text):
     lengths = [len(s.split()) for s in sentences]
     return len(sentences), float(np.mean(lengths)), (float(np.std(lengths)) if len(lengths) > 1 else 0.0)
 
-
 HEDGE_LEXICON = {
-    "might",
-    "may",
-    "could",
-    "can",
-    "seems",
-    "seem",
-    "maybe",
-    "perhaps",
-    "likely",
-    "unlikely",
-    "generally",
-    "often",
-    "sometimes",
-    "possibly",
-    "potentially",
-    "approximately",
-    "roughly",
-    "suggest",
-    "suggests",
-    "guess",
-    "guesses",
-    "estimate",
-    "estimated",
-    "depends",
-    "unclear",
+    "might","may","could","can","seems","seem","maybe","perhaps","likely","unlikely","generally","often",
+    "sometimes","possibly","potentially","approximately","roughly","suggest","suggests","guess","guesses",
+    "estimate","estimated","depends","unclear",
 }
 
 POLITENESS_LEXICON = {
-    "please",
-    "thanks",
-    "thank",
-    "appreciate",
-    "sorry",
-    "welcome",
-    "glad",
-    "happy",
-    "sure",
-    "certainly",
-    "kindly",
+    "please","thanks","thank","appreciate","sorry","welcome","glad","happy","sure","certainly","kindly",
 }
 
 CONFIDENCE_RE = r"\b(will|must|always|never|definitely)\b"
 analyzer = SentimentIntensityAnalyzer()
 
+def readability_score(text):
+    """Optional textstat-based readability. Returns 0.0 if textstat unavailable."""
+    if not HAS_TEXTSTAT:
+        return 0.0
+    try:
+        return float(textstat.flesch_reading_ease(str(text)))
+    except Exception:
+        return 0.0
 
+# Feature engineering
 def engineer_all(df):
     df = df.copy()
     for col in ("prompt", "response_a", "response_b"):
@@ -283,10 +280,11 @@ def engineer_all(df):
     df["resp_b_is_ai"] = df["response_b"].str.lower().str.count(r"an ai")
     df["ai_diff"] = df["resp_b_is_ai"] - df["resp_a_is_ai"]
 
-    df["a_lang_match"] = (df["prompt_lang"] == df["resp_a_lang"]).astype(int)
-    df["b_lang_match"] = (df["prompt_lang"] == df["resp_b_lang"]).astype(int)
+    # Language match
+    df["a_lang_match"] = (df["prompt_lang"] == df["resp_a_lang"]).astype(int) if "prompt_lang" in df.columns else 0
+    df["b_lang_match"] = (df["prompt_lang"] == df["resp_b_lang"]).astype(int) if "prompt_lang" in df.columns else 0
     df["lang_match_diff"] = df["b_lang_match"] - df["a_lang_match"]
-    df["is_prompt_en"] = (df["prompt_lang"] == "en").astype(int)
+    df["is_prompt_en"] = (df["prompt_lang"] == "en").astype(int) if "prompt_lang" in df.columns else 0
 
     df["resp_a_lexdiv"] = df["response_a"].apply(lexical_diversity)
     df["resp_b_lexdiv"] = df["response_b"].apply(lexical_diversity)
@@ -311,10 +309,12 @@ def engineer_all(df):
     df["resp_b_has_refusal"] = (df["resp_b_refusal"] > 0).astype(int)
     df["has_refusal_diff"] = df["resp_b_has_refusal"] - df["resp_a_has_refusal"]
 
-    df["resp_a_readability"] = df["response_a"].apply(textstat.flesch_reading_ease)
-    df["resp_b_readability"] = df["response_b"].apply(textstat.flesch_reading_ease)
+    # Readability
+    df["resp_a_readability"] = df["response_a"].apply(readability_score)
+    df["resp_b_readability"] = df["response_b"].apply(readability_score)
     df["readability_diff"] = df["resp_b_readability"] - df["resp_a_readability"]
 
+    # TextBlob + VADER
     df["resp_a_sentiment"] = df["response_a"].apply(lambda x: TextBlob(x).sentiment.polarity)
     df["resp_b_sentiment"] = df["response_b"].apply(lambda x: TextBlob(x).sentiment.polarity)
     df["sentiment_diff"] = df["resp_b_sentiment"] - df["resp_a_sentiment"]
@@ -425,118 +425,52 @@ test["resp_similarity"] = np.array([cos_sim(a, b)[0][0] for a, b in zip(ta_test,
 
 print("TF-IDF features ✓")
 
+# feature_cols includes readability + lang match
 feature_cols = [
-    "resp_a_len",
-    "resp_b_len",
-    "len_diff",
-    "resp_a_word_count",
-    "resp_b_word_count",
-    "word_count_diff",
-    "prompt_word_count",
-    "prompt_len",
-    "resp_a_len_ratio",
-    "resp_b_len_ratio",
-    "len_ratio_diff",
-    "len_ratio",
-    "word_ratio",
-    "resp_a_bold",
-    "resp_b_bold",
-    "bold_diff",
-    "resp_a_hash",
-    "resp_b_hash",
-    "hash_diff",
-    "resp_a_new_line",
-    "resp_b_new_line",
-    "new_line_diff",
-    "resp_a_code",
-    "resp_b_code",
-    "code_diff",
-    "resp_a_list",
-    "resp_b_list",
-    "list_diff",
-    "resp_a_excl",
-    "resp_b_excl",
-    "excl_diff",
-    "resp_a_question",
-    "resp_b_question",
-    "question_diff",
-    "resp_a_quote",
-    "resp_b_quote",
-    "quote_diff",
-    "resp_a_sentences",
-    "resp_b_sentences",
-    "sentence_diff",
-    "sentence_ratio",
-    "resp_a_sent_count",
-    "resp_b_sent_count",
-    "sent_count_diff",
-    "resp_a_avg_sent_len",
-    "resp_b_avg_sent_len",
-    "avg_sent_len_diff",
-    "resp_a_sent_var",
-    "resp_b_sent_var",
-    "sent_var_diff",
-    "resp_a_overlap",
-    "resp_b_overlap",
-    "overlap_diff",
-    "overlap_ratio",
-    "resp_a_confidence",
-    "resp_b_confidence",
-    "confidence_diff",
-    "resp_a_is_ai",
-    "resp_b_is_ai",
-    "ai_diff",
-    "resp_a_refusal",
-    "resp_b_refusal",
-    "refusal_diff",
-    "resp_a_has_refusal",
-    "resp_b_has_refusal",
-    "has_refusal_diff",
-    "resp_a_lexdiv",
-    "resp_b_lexdiv",
-    "lexdiv_diff",
-    "resp_a_vocab_rich",
-    "resp_b_vocab_rich",
-    "vocab_rich_diff",
-    "resp_a_hedge",
-    "resp_b_hedge",
-    "hedge_diff",
-    "resp_a_polite",
-    "resp_b_polite",
-    "polite_diff",
-    "resp_a_readability",
-    "resp_b_readability",
-    "readability_diff",
-    "resp_a_sentiment",
-    "resp_b_sentiment",
-    "sentiment_diff",
-    "prompt_compound",
-    "resp_a_compound",
-    "resp_b_compound",
-    "compound_diff",
-    "prompt_neg",
-    "resp_a_neg",
-    "resp_b_neg",
-    "neg_diff",
-    "prompt_pos",
-    "resp_a_pos",
-    "resp_b_pos",
-    "pos_diff",
-    "prompt_neu",
-    "resp_a_neu",
-    "resp_b_neu",
-    "neu_diff",
-    "is_prompt_en",
-    "a_lang_match",
-    "b_lang_match",
-    "lang_match_diff",
-    "prompt_punct_per_word",
-    "prompt_has_question",
-    "len_x_overlap",
-    "len_x_compound",
-    "tf_sim_a",
-    "tf_sim_b",
-    "tf_sim_diff",
+    "resp_a_len","resp_b_len","len_diff",
+    "resp_a_word_count","resp_b_word_count","word_count_diff",
+    "prompt_word_count","prompt_len",
+    "resp_a_len_ratio","resp_b_len_ratio","len_ratio_diff",
+    "len_ratio","word_ratio",
+    "resp_a_bold","resp_b_bold","bold_diff",
+    "resp_a_hash","resp_b_hash","hash_diff",
+    "resp_a_new_line","resp_b_new_line","new_line_diff",
+    "resp_a_code","resp_b_code","code_diff",
+    "resp_a_list","resp_b_list","list_diff",
+    "resp_a_excl","resp_b_excl","excl_diff",
+    "resp_a_question","resp_b_question","question_diff",
+    "resp_a_quote","resp_b_quote","quote_diff",
+    "resp_a_sentences","resp_b_sentences","sentence_diff","sentence_ratio",
+    "resp_a_sent_count","resp_b_sent_count","sent_count_diff",
+    "resp_a_avg_sent_len","resp_b_avg_sent_len","avg_sent_len_diff",
+    "resp_a_sent_var","resp_b_sent_var","sent_var_diff",
+    "resp_a_overlap","resp_b_overlap","overlap_diff","overlap_ratio",
+    "resp_a_confidence","resp_b_confidence","confidence_diff",
+    "resp_a_is_ai","resp_b_is_ai","ai_diff",
+    "resp_a_refusal","resp_b_refusal","refusal_diff",
+    "resp_a_has_refusal","resp_b_has_refusal","has_refusal_diff",
+    "resp_a_lexdiv","resp_b_lexdiv","lexdiv_diff",
+    "resp_a_vocab_rich","resp_b_vocab_rich","vocab_rich_diff",
+    "resp_a_hedge","resp_b_hedge","hedge_diff",
+    "resp_a_polite","resp_b_polite","polite_diff",
+
+    # readability + language match
+    "resp_a_readability","resp_b_readability","readability_diff",
+    "is_prompt_en","a_lang_match","b_lang_match","lang_match_diff",
+
+    # sentiment
+    "resp_a_sentiment","resp_b_sentiment","sentiment_diff",
+    "prompt_compound","resp_a_compound","resp_b_compound","compound_diff",
+    "prompt_neg","resp_a_neg","resp_b_neg","neg_diff",
+    "prompt_pos","resp_a_pos","resp_b_pos","pos_diff",
+    "prompt_neu","resp_a_neu","resp_b_neu","neu_diff",
+
+    # prompt style + interactions
+    "prompt_punct_per_word","prompt_has_question",
+    "len_x_overlap","len_x_compound",
+
+    # tfidf sims
+    "tf_sim_a","tf_sim_b","tf_sim_diff",
     "resp_similarity",
 ] + svd_cols + bi_cols
 
@@ -550,10 +484,8 @@ print(f"Feature count: {len(feature_cols)}")
 SEP = "═" * 72
 THIN = "─" * 72
 
-
 def pct(v):
     return f"{v:.1%}"
-
 
 def pval_flag(p):
     if p < 0.001:
@@ -563,7 +495,6 @@ def pval_flag(p):
     if p < 0.05:
         return "*"
     return "ns"
-
 
 print(f"\n{SEP}")
 print("  FEATURE WIN RATES  (side with MORE of X → win rate)")
@@ -689,7 +620,17 @@ models = {
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(multi_class="multinomial", solver="saga", C=1.0, max_iter=3000, n_jobs=-1, random_state=42)),
+            (
+                "clf",
+                LogisticRegression(
+                    multi_class="multinomial",
+                    solver="saga",
+                    C=1.0,
+                    max_iter=3000,
+                    n_jobs=-1,
+                    random_state=42,
+                ),
+            ),
         ]
     ),
 }
@@ -733,7 +674,17 @@ for name, model in models.items():
                 steps=[
                     ("imputer", SimpleImputer(strategy="median")),
                     ("scaler", StandardScaler()),
-                    ("clf", LogisticRegression(multi_class="multinomial", solver="saga", C=1.0, max_iter=3000, n_jobs=-1, random_state=42)),
+                    (
+                        "clf",
+                        LogisticRegression(
+                            multi_class="multinomial",
+                            solver="saga",
+                            C=1.0,
+                            max_iter=3000,
+                            n_jobs=-1,
+                            random_state=42,
+                        ),
+                    ),
                 ]
             )
             m.fit(X_tr, y_tr)
@@ -759,7 +710,9 @@ for name, model in models.items():
 
 print("  5-Fold CV Summary")
 for name, res in cv_results.items():
-    print(f"{name:>10}:  logloss={res['logloss_mean']:.4f} ± {res['logloss_std']:.4f}   acc={res['acc_mean']:.4f} ± {res['acc_std']:.4f}")
+    print(
+        f"{name:>10}:  logloss={res['logloss_mean']:.4f} ± {res['logloss_std']:.4f}   acc={res['acc_mean']:.4f} ± {res['acc_std']:.4f}"
+    )
 
 print("Training baseline models...")
 results = {}
@@ -797,15 +750,6 @@ assert clf.coef_.shape[1] == len(feature_cols), "Mismatch: coef columns != featu
 
 coef_df = pd.DataFrame(clf.coef_, columns=feature_cols, index=le.classes_)
 
-
-def show_top_features(class_label, top_n=15):
-    coefs = coef_df.loc[class_label].sort_values()
-    print(f"\nTop {top_n} features pushing TOWARD {class_label}:")
-    print(coefs.tail(top_n)[::-1])
-    print(f"\nTop {top_n} features pushing AWAY from {class_label}:")
-    print(coefs.head(top_n))
-
-
 def plot_logreg_top(class_label, top_n=15):
     coefs = coef_df.loc[class_label]
     top = coefs.abs().sort_values(ascending=False).head(top_n).index
@@ -816,7 +760,6 @@ def plot_logreg_top(class_label, top_n=15):
     plt.axvline(0, color="black")
     plt.tight_layout()
     plt.show()
-
 
 plot_logreg_top("A")
 plot_logreg_top("B")
@@ -845,7 +788,6 @@ plt.rcParams.update(
 
 BLUE = "#2C6FAC"
 RED = "#C0392B"
-
 
 def plot_win_rates(results_df, save_path="/content/fig1_win_rates.png"):
     df = results_df[results_df["significant"] != "ns"].copy().sort_values("more_wins", ascending=True)
@@ -885,7 +827,6 @@ def plot_win_rates(results_df, save_path="/content/fig1_win_rates.png"):
     plt.close()
     print(f"Saved → {save_path}")
 
-
 def plot_feature_importance(final_model, feature_cols, top_n=20, save_path="/content/fig2_feature_importance.png"):
     booster = final_model.get_booster()
     score = booster.get_score(importance_type="gain")
@@ -913,7 +854,6 @@ def plot_feature_importance(final_model, feature_cols, top_n=20, save_path="/con
     plt.close()
     print(f"Saved → {save_path}")
 
-
 def plot_confusion_matrix(model, X_valid, y_valid, le, save_path="/content/fig3_confusion_matrix.png"):
     y_pred = model.predict(X_valid)
     cm = confusion_matrix(y_valid, y_pred)
@@ -934,7 +874,11 @@ def plot_confusion_matrix(model, X_valid, y_valid, le, save_path="/content/fig3_
         thresh = data.max() * 0.6
         for i in range(n):
             for j in range(n):
-                ax.text(j, i, fmt(data[i, j]), ha="center", va="center", fontsize=11, color="white" if data[i, j] > thresh else "black")
+                ax.text(
+                    j, i, fmt(data[i, j]),
+                    ha="center", va="center", fontsize=11,
+                    color="white" if data[i, j] > thresh else "black",
+                )
         ax.set_xticks(range(n))
         ax.set_yticks(range(n))
         ax.set_xticklabels([f"Pred {c}" for c in class_names])
@@ -942,14 +886,295 @@ def plot_confusion_matrix(model, X_valid, y_valid, le, save_path="/content/fig3_
         ax.set_xlabel("Predicted Label", labelpad=8)
         ax.set_ylabel("True Label", labelpad=8)
 
-    fig.suptitle(f"Fig. 3 — Confusion Matrix on Held-Out Validation Set\n(n = {len(y_valid):,}  |  XGBoost tuned params)", fontsize=11, y=1.02)
+    fig.suptitle(
+        f"Fig. 3 — Confusion Matrix on Held-Out Validation Set\n(n = {len(y_valid):,}  |  XGBoost tuned params)",
+        fontsize=11, y=1.02,
+    )
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
     print(f"Saved → {save_path}")
 
-
 plot_win_rates(results_df)
 plot_feature_importance(final_model, feature_cols, top_n=20)
 plot_confusion_matrix(final_model, X_valid, y_valid, le)
 print("\nAll figures saved.")
+
+
+"""
+OOF hyperparam search + OOF-weight optimization + full-train retrain
+WITH early stopping inside CV for XGBoost + LightGBM + CatBoost.
+
+Notes:
+- Early stopping is applied per-fold using the fold's validation split.
+- For full-train refit, we do a small internal split to pick best_iteration for each model.
+"""
+
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+
+N_CLASSES = len(le.classes_)
+N = X.shape[0]
+
+# CV config
+n_splits = 5
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+
+# Trials per model
+N_TRIALS = {"XGBoost": 15, "LightGBM": 15, "CatBoost": 15}
+
+# Hyperparam samplers (random search)
+def sample_xgb_params():
+    return {
+        "objective": "multi:softprob",
+        "num_class": N_CLASSES,
+        "n_estimators": int(random.choice([2000, 3000, 5000])),
+        "learning_rate": float(10 ** random.uniform(-2.2, -0.7)),
+        "max_depth": int(random.choice([4, 5, 6, 7, 8])),
+        "min_child_weight": float(random.choice([1.0, 2.0, 5.0, 10.0])),
+        "subsample": float(random.uniform(0.6, 1.0)),
+        "colsample_bytree": float(random.uniform(0.6, 1.0)),
+        "reg_lambda": float(10 ** random.uniform(-2, 1)),
+        "reg_alpha": float(10 ** random.uniform(-4, 0)),
+        "tree_method": "hist",
+        "random_state": SEED,
+        "n_jobs": 1,
+        "eval_metric": "mlogloss",
+    }
+
+def sample_lgb_params():
+    return {
+        "objective": "multiclass",
+        "num_class": N_CLASSES,
+        "n_estimators": int(random.choice([5000, 8000, 12000])),
+        "learning_rate": float(10 ** random.uniform(-2.2, -0.7)),
+        "num_leaves": int(random.choice([31, 63, 127, 255])),
+        "max_depth": int(random.choice([-1, 6, 8, 10])),
+        "min_child_samples": int(random.choice([10, 20, 40, 80])),
+        "subsample": float(random.uniform(0.6, 1.0)),
+        "colsample_bytree": float(random.uniform(0.6, 1.0)),
+        "reg_lambda": float(10 ** random.uniform(-2, 1)),
+        "random_state": SEED,
+        "n_jobs": 1,
+        "verbosity": -1,
+    }
+
+def sample_cat_params():
+    return {
+        "loss_function": "MultiClass",
+        "eval_metric": "MultiClass",
+        "iterations": int(random.choice([3000, 5000, 8000])),
+        "learning_rate": float(10 ** random.uniform(-2.2, -0.7)),
+        "depth": int(random.choice([4, 6, 8, 10])),
+        "l2_leaf_reg": float(10 ** random.uniform(-2, 1)),
+        "random_strength": float(random.uniform(0.0, 2.0)),
+        "bagging_temperature": float(random.uniform(0.0, 1.0)),
+        "bootstrap_type": random.choice(["Bayesian", "Bernoulli"]),
+        "subsample": float(random.uniform(0.6, 1.0)),
+        "rsm": float(random.uniform(0.6, 1.0)),
+        "min_data_in_leaf": int(random.choice([1, 5, 10, 20, 50])),
+        "random_seed": SEED,
+        "verbose": 0,
+        "use_best_model": True,
+        "od_type": "Iter",
+        "od_wait": int(random.choice([100, 200, 300])),
+    }
+
+# CV runner with early stopping
+def cv_oof_xgb(params, X, y, skf, early_stopping_rounds=100):
+    oof = np.zeros((X.shape[0], N_CLASSES), dtype=np.float32)
+    fold_logs = []
+    best_iters = []
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), 1):
+        X_tr, X_va = X[tr_idx], X[va_idx]
+        y_tr, y_va = y[tr_idx], y[va_idx]
+
+        m = XGBClassifier(**params, early_stopping_rounds=early_stopping_rounds)
+        m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+
+        probs = m.predict_proba(X_va)
+        oof[va_idx] = probs
+        fold_ll = log_loss(y_va, probs)
+        fold_logs.append(fold_ll)
+
+        bi = getattr(m, "best_iteration", None)
+        best_iters.append(int(bi + 1) if bi is not None else int(params["n_estimators"]))
+
+    overall = log_loss(y, oof)
+    return oof, overall, fold_logs, best_iters
+
+def cv_oof_lgb(params, X, y, skf, early_stopping_rounds=200):
+    oof = np.zeros((X.shape[0], N_CLASSES), dtype=np.float32)
+    fold_logs = []
+    best_iters = []
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), 1):
+        X_tr, X_va = X[tr_idx], X[va_idx]
+        y_tr, y_va = y[tr_idx], y[va_idx]
+
+        m = LGBMClassifier(**params)
+        m.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            eval_metric="multi_logloss",
+            callbacks=[__import__("lightgbm").early_stopping(early_stopping_rounds, verbose=False)],
+        )
+
+        probs = m.predict_proba(X_va)
+        oof[va_idx] = probs
+        fold_ll = log_loss(y_va, probs)
+        fold_logs.append(fold_ll)
+
+        bi = getattr(m, "best_iteration_", None)
+        best_iters.append(int(bi) if bi is not None else int(params["n_estimators"]))
+
+    overall = log_loss(y, oof)
+    return oof, overall, fold_logs, best_iters
+
+def cv_oof_cat(params, X, y, skf):
+    oof = np.zeros((X.shape[0], N_CLASSES), dtype=np.float32)
+    fold_logs = []
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), 1):
+        X_tr, X_va = X[tr_idx], X[va_idx]
+        y_tr, y_va = y[tr_idx], y[va_idx]
+
+        m = CatBoostClassifier(**params)
+        m.fit(X_tr, y_tr, eval_set=(X_va, y_va))
+
+        probs = m.predict_proba(X_va)
+        oof[va_idx] = probs
+        fold_logs.append(log_loss(y_va, probs))
+
+    overall = log_loss(y, oof)
+    return oof, overall, fold_logs
+
+# Random search wrappers
+def randomized_search_xgb(X, y, skf, n_trials=15):
+    best_params, best_oof, best_score, best_bestiters = None, None, float("inf"), None
+    for t in range(1, n_trials + 1):
+        params = sample_xgb_params()
+        oof, overall, fold_logs, best_iters = cv_oof_xgb(params, X, y, skf)
+        print(
+            f"[XGBoost] Trial {t}/{n_trials} OOF={overall:.6f} "
+            f"folds={[round(x,6) for x in fold_logs]} best_iters={int(np.median(best_iters))}"
+        )
+        if overall < best_score:
+            best_score, best_params, best_oof, best_bestiters = overall, params, oof.copy(), best_iters
+    best_n_estimators = int(np.median(best_bestiters)) if best_bestiters is not None else best_params["n_estimators"]
+    best_params_full = dict(best_params)
+    best_params_full["n_estimators"] = best_n_estimators
+    print(f"--> Best XGBoost OOF={best_score:.6f}, refit n_estimators={best_n_estimators}\nparams={best_params_full}\n")
+    return best_params_full, best_oof, best_score
+
+def randomized_search_lgb(X, y, skf, n_trials=15):
+    best_params, best_oof, best_score, best_bestiters = None, None, float("inf"), None
+    for t in range(1, n_trials + 1):
+        params = sample_lgb_params()
+        oof, overall, fold_logs, best_iters = cv_oof_lgb(params, X, y, skf)
+        print(
+            f"[LightGBM] Trial {t}/{n_trials} OOF={overall:.6f} "
+            f"folds={[round(x,6) for x in fold_logs]} best_iters={int(np.median(best_iters))}"
+        )
+        if overall < best_score:
+            best_score, best_params, best_oof, best_bestiters = overall, params, oof.copy(), best_iters
+    best_n_estimators = int(np.median(best_bestiters)) if best_bestiters is not None else best_params["n_estimators"]
+    best_params_full = dict(best_params)
+    best_params_full["n_estimators"] = best_n_estimators
+    print(f"--> Best LightGBM OOF={best_score:.6f}, refit n_estimators={best_n_estimators}\nparams={best_params_full}\n")
+    return best_params_full, best_oof, best_score
+
+def randomized_search_cat(X, y, skf, n_trials=15):
+    best_params, best_oof, best_score = None, None, float("inf")
+    for t in range(1, n_trials + 1):
+        params = sample_cat_params()
+        oof, overall, fold_logs = cv_oof_cat(params, X, y, skf)
+        print(f"[CatBoost] Trial {t}/{n_trials} OOF={overall:.6f} folds={[round(x,6) for x in fold_logs]}")
+        if overall < best_score:
+            best_score, best_params, best_oof = overall, params, oof.copy()
+    print(f"--> Best CatBoost OOF={best_score:.6f}\nparams={best_params}\n")
+    return best_params, best_oof, best_score
+
+# Run searches
+t0 = time.time()
+best_xgb_params, oof_xgb, ll_xgb = randomized_search_xgb(X, y, skf, n_trials=N_TRIALS["XGBoost"])
+best_lgb_params, oof_lgb, ll_lgb = randomized_search_lgb(X, y, skf, n_trials=N_TRIALS["LightGBM"])
+best_cat_params, oof_cat, ll_cat = randomized_search_cat(X, y, skf, n_trials=N_TRIALS["CatBoost"])
+print(f"Search done in {(time.time()-t0)/60:.2f} min")
+
+# Optimize ensemble weights on OOF
+model_names = ["XGBoost", "LightGBM", "CatBoost"]
+oof_probs = {"XGBoost": oof_xgb, "LightGBM": oof_lgb, "CatBoost": oof_cat}
+P = np.stack([oof_probs[n] for n in model_names], axis=0)  # (M, N, C)
+
+def ens_loss(w):
+    w = np.clip(w, 0, 1)
+    w = w / (w.sum() + 1e-12)
+    blended = np.tensordot(w, P, axes=(0, 0))  # (N, C)
+    return log_loss(y, blended)
+
+x0 = np.ones(len(model_names)) / len(model_names)
+cons = ({"type": "eq", "fun": lambda w: np.sum(w) - 1.0},)
+bounds = [(0.0, 1.0)] * len(model_names)
+res = minimize(ens_loss, x0, method="SLSQP", bounds=bounds, constraints=cons, options={"maxiter": 200})
+w_opt = np.clip(res.x, 0, 1)
+w_opt = w_opt / (w_opt.sum() + 1e-12)
+
+print("\nBest OOF weights:")
+for n, w_ in zip(model_names, w_opt):
+    print(f"  {n:>8}: {w_:.4f}")
+print(f"Best OOF ensemble logloss: {ens_loss(w_opt):.6f}")
+
+# Full-train retrain with early stopping for XGB/LGB/CB
+X_tr_full, X_va_full, y_tr_full, y_va_full = train_test_split(
+    X, y, test_size=0.15, stratify=y, random_state=SEED
+)
+
+xgb_full_params = dict(best_xgb_params)
+xgb_full_params["n_estimators"] = max(int(best_xgb_params.get("n_estimators", 2000)), 2000)
+xgb_full = XGBClassifier(**xgb_full_params, early_stopping_rounds=150)
+xgb_full.fit(X_tr_full, y_tr_full, eval_set=[(X_va_full, y_va_full)], verbose=False)
+p_test_xgb = xgb_full.predict_proba(X_test)
+
+lgb_full_params = dict(best_lgb_params)
+lgb_full_params["n_estimators"] = max(int(best_lgb_params.get("n_estimators", 5000)), 5000)
+lgb_full = LGBMClassifier(**lgb_full_params)
+lgb_full.fit(
+    X_tr_full, y_tr_full,
+    eval_set=[(X_va_full, y_va_full)],
+    eval_metric="multi_logloss",
+    callbacks=[__import__("lightgbm").early_stopping(300, verbose=False)],
+)
+p_test_lgb = lgb_full.predict_proba(X_test)
+
+cat_full_params = dict(best_cat_params)
+cat_full_params["iterations"] = max(int(best_cat_params.get("iterations", 3000)), 3000)
+cat_full_params.update(
+    {
+        "use_best_model": True,
+        "od_type": "Iter",
+        "od_wait": 300,
+        "eval_metric": "MultiClass",
+        "verbose": 0,
+    }
+)
+cat_full = CatBoostClassifier(**cat_full_params)
+cat_full.fit(X_tr_full, y_tr_full, eval_set=(X_va_full, y_va_full))
+p_test_cat = cat_full.predict_proba(X_test)
+
+p_test_ens = w_opt[0] * p_test_xgb + w_opt[1] * p_test_lgb + w_opt[2] * p_test_cat
+p_test_ens = np.clip(p_test_ens, 1e-12, 1.0)
+p_test_ens = p_test_ens / p_test_ens.sum(axis=1, keepdims=True)
+
+pd.to_pickle(
+    {
+        "best_params": {"XGBoost": best_xgb_params, "LightGBM": best_lgb_params, "CatBoost": best_cat_params},
+        "weights": dict(zip(model_names, w_opt)),
+        "oof_logloss": {"XGBoost": ll_xgb, "LightGBM": ll_lgb, "CatBoost": ll_cat, "Ensemble": ens_loss(w_opt)},
+        "has_langdetect": HAS_LANGDETECT,
+        "has_textstat": HAS_TEXTSTAT,
+    },
+    "oof_search_results_es.pkl",
+)
+print("Saved -> oof_search_results_es.pkl")
