@@ -69,12 +69,17 @@ analyzer = None
 try:
     import nltk
     from nltk.sentiment.vader import SentimentIntensityAnalyzer
+    
+    # Check if exists, if not, download it
     try:
-        nltk.data.find("sentiment/vader_lexicon.zip")
-        HAS_VADER = True
-    except LookupError:
-        HAS_VADER = False
-except Exception:
+        nltk.data.find("sentiment/vader_lexicon")
+    except (LookupError, AttributeError):
+        nltk.download('vader_lexicon', quiet=True)
+        
+    analyzer = SentimentIntensityAnalyzer()
+    HAS_VADER = True
+except Exception as e:
+    print(f"[INFO] VADER setup failed: {e}")
     HAS_VADER = False
 
 if HAS_VADER:
