@@ -1,0 +1,572 @@
+# XGB + LGBM + CatBoost Ensemble
+
+import json
+import re
+import warnings
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import normalize as sk_normalize
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+
+TRAIN_PATH = "/kaggle/input/competitions/llm-classification-finetuning/train.csv"
+TEST_PATH  = "/kaggle/input/competitions/llm-classification-finetuning/test.csv"
+
+train = pd.read_csv(TRAIN_PATH)
+test  = pd.read_csv(TEST_PATH)
+
+# Optional deps
+HAS_LANGDETECT = False
+try:
+    from langdetect import detect, DetectorFactory
+    DetectorFactory.seed = 42
+    HAS_LANGDETECT = True
+except Exception:
+    print("[INFO] langdetect unavailable; language features will be disabled.")
+    HAS_LANGDETECT = False
+
+HAS_TEXTSTAT = False
+try:
+    import textstat
+    HAS_TEXTSTAT = True
+except Exception:
+    print("[INFO] textstat unavailable; readability features will be disabled.")
+    HAS_TEXTSTAT = False
+
+HAS_TEXTBLOB = False
+try:
+    from textblob import TextBlob
+    HAS_TEXTBLOB = True
+except Exception:
+    HAS_TEXTBLOB = False
+    print("[INFO] TextBlob unavailable; polarity features will be disabled.")
+
+HAS_VADER = False
+analyzer = None
+try:
+    import nltk
+    try:
+        from nltk.sentiment.vader import SentimentIntensityAnalyzer
+        try:
+            nltk.data.find("sentiment/vader_lexicon.zip")
+        except Exception:
+            try:
+                nltk.download("vader_lexicon", quiet=True)
+            except Exception:
+                pass
+        try:
+            analyzer = SentimentIntensityAnalyzer()
+            HAS_VADER = True
+        except Exception:
+            HAS_VADER = False
+            analyzer = None
+    except Exception:
+        HAS_VADER = False
+        analyzer = None
+except Exception:
+    HAS_VADER = False
+    analyzer = None
+
+# Parsing
+def parse_response(resp):
+    try:
+        parsed = json.loads(resp)
+        if isinstance(parsed, list):
+            return " ".join(str(t) for t in parsed)
+        return str(parsed)
+    except Exception:
+        return str(resp)
+
+for df in (train, test):
+    df["prompt"] = df["prompt"].fillna("").astype(str)
+    df["response_a"] = df["response_a"].apply(parse_response).fillna("").astype(str)
+    df["response_b"] = df["response_b"].apply(parse_response).fillna("").astype(str)
+
+train["winner"] = np.select(
+    [train["winner_model_a"] == 1, train["winner_model_b"] == 1],
+    ["A", "B"],
+    default="Tie",
+)
+
+print(f"Train: {len(train):,} rows  |  Test: {len(test):,} rows")
+print(
+    f"A wins: {(train['winner']=='A').sum():,}  "
+    f"B wins: {(train['winner']=='B').sum():,}  "
+    f"Ties: {(train['winner']=='Tie').sum():,}"
+)
+
+# Text helpers
+_word_re = re.compile(r"[A-Za-z']+")
+
+def tokenize(text):
+    if not isinstance(text, str):
+        return []
+    return _word_re.findall(text.lower())
+
+def lexical_diversity(text):
+    toks = tokenize(text)
+    return len(set(toks)) / len(toks) if toks else 0.0
+
+def count_lexicon(text, lexicon):
+    s = set(lexicon)
+    return sum(1 for t in tokenize(text) if t in s)
+
+def vocab_richness(text):
+    words = str(text).lower().split()
+    return len(set(words)) / len(words) if words else 0.0
+
+def keyword_overlap(prompt, response):
+    p = set(str(prompt).lower().split())
+    r = set(str(response).lower().split())
+    return len(p & r) / len(p) if p else 0.0
+
+def refusal_score(text):
+    text = str(text).lower()
+    score = 0
+    for phrase in [
+        "i cannot","i can't","i am not able","i'm not able","i'm unable","i am unable",
+        "can't satisfy your request","cannot satisfy your request","i must decline",
+        "i'm not going to","i can not",
+    ]:
+        score += text.count(phrase) * 3
+    for phrase in ["i'm sorry","i am sorry","i apologize","my apologies","sorry,","sorry.","unfortunately"]:
+        score += text.count(phrase) * 2
+    for phrase in ["sorry","apologize","apologies","regret"]:
+        score += text.count(phrase) * 1
+    return score
+
+def sentence_stats(text):
+    sentences = re.split(r"[.!?]+", str(text))
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return 0, 0.0, 0.0
+    lengths = [len(s.split()) for s in sentences]
+    return len(sentences), float(np.mean(lengths)), (float(np.std(lengths)) if len(lengths) > 1 else 0.0)
+
+HEDGE_LEXICON = {
+    "might","may","could","can","seems","seem","maybe","perhaps","likely","unlikely","generally","often",
+    "sometimes","possibly","potentially","approximately","roughly","suggest","suggests","guess","guesses",
+    "estimate","estimated","depends","unclear",
+}
+
+POLITENESS_LEXICON = {
+    "please","thanks","thank","appreciate","sorry","welcome","glad","happy","sure","certainly","kindly",
+}
+
+CONFIDENCE_RE = r"\b(will|must|always|never|definitely)\b"
+
+def tb_polarity(text):
+    if not HAS_TEXTBLOB:
+        return 0.0
+    try:
+        return float(TextBlob(str(text)).sentiment.polarity)
+    except Exception:
+        return 0.0
+
+def vader_scores(text):
+    if analyzer is None:
+        return {"neg":0.0,"neu":0.0,"pos":0.0,"compound":0.0}
+    try:
+        return analyzer.polarity_scores(str(text))
+    except Exception:
+        return {"neg":0.0,"neu":0.0,"pos":0.0,"compound":0.0}
+
+# Feature engineering
+def engineer_all(df):
+    df = df.copy()
+    for col in ("prompt", "response_a", "response_b"):
+        df[col] = df[col].fillna("").astype(str)
+
+    df["prompt_len"] = df["prompt"].str.len()
+    df["resp_a_len"] = df["response_a"].str.len()
+    df["resp_b_len"] = df["response_b"].str.len()
+    df["len_diff"] = df["resp_b_len"] - df["resp_a_len"]
+
+    df["prompt_word_count"] = df["prompt"].str.split().str.len()
+    df["resp_a_word_count"] = df["response_a"].str.split().str.len()
+    df["resp_b_word_count"] = df["response_b"].str.split().str.len()
+    df["word_count_diff"] = df["resp_b_word_count"] - df["resp_a_word_count"]
+
+    df["resp_a_len_ratio"] = df["resp_a_word_count"] / (df["prompt_word_count"] + 1)
+    df["resp_b_len_ratio"] = df["resp_b_word_count"] / (df["prompt_word_count"] + 1)
+    df["len_ratio_diff"] = df["resp_b_len_ratio"] - df["resp_a_len_ratio"]
+    df["len_ratio"] = df["resp_b_len"] / (df["resp_a_len"] + 1)
+    df["word_ratio"] = df["resp_b_word_count"] / (df["resp_a_word_count"] + 1)
+
+    df["resp_a_bold"] = df["response_a"].str.count(r"\*\*")
+    df["resp_b_bold"] = df["response_b"].str.count(r"\*\*")
+    df["bold_diff"] = df["resp_b_bold"] - df["resp_a_bold"]
+
+    df["resp_a_hash"] = df["response_a"].str.count(r"##")
+    df["resp_b_hash"] = df["response_b"].str.count(r"##")
+    df["hash_diff"] = df["resp_b_hash"] - df["resp_a_hash"]
+
+    df["resp_a_new_line"] = df["response_a"].str.count(r"\n")
+    df["resp_b_new_line"] = df["response_b"].str.count(r"\n")
+    df["new_line_diff"] = df["resp_b_new_line"] - df["resp_a_new_line"]
+
+    df["resp_a_code"] = df["response_a"].str.count(r"`")
+    df["resp_b_code"] = df["response_b"].str.count(r"`")
+    df["code_diff"] = df["resp_b_code"] - df["resp_a_code"]
+
+    df["resp_a_list"] = df["response_a"].str.count(r"(?m)^\s*(?:\d+\.|\-|\*|\+)\s+")
+    df["resp_b_list"] = df["response_b"].str.count(r"(?m)^\s*(?:\d+\.|\-|\*|\+)\s+")
+    df["list_diff"] = df["resp_b_list"] - df["resp_a_list"]
+
+    df["resp_a_excl"] = df["response_a"].str.count(r"!")
+    df["resp_b_excl"] = df["response_b"].str.count(r"!")
+    df["excl_diff"] = df["resp_b_excl"] - df["resp_a_excl"]
+
+    df["resp_a_question"] = df["response_a"].str.count(r"\?")
+    df["resp_b_question"] = df["response_b"].str.count(r"\?")
+    df["question_diff"] = df["resp_b_question"] - df["resp_a_question"]
+
+    df["resp_a_quote"] = df["response_a"].str.count(r'"')
+    df["resp_b_quote"] = df["response_b"].str.count(r'"')
+    df["quote_diff"] = df["resp_b_quote"] - df["resp_a_quote"]
+
+    df["resp_a_sentences"] = df["response_a"].str.count(r"[.!?]")
+    df["resp_b_sentences"] = df["response_b"].str.count(r"[.!?]")
+    df["sentence_diff"] = df["resp_b_sentences"] - df["resp_a_sentences"]
+    df["sentence_ratio"] = df["resp_b_sentences"] / (df["resp_a_sentences"] + 1)
+
+    stats_a = df["response_a"].apply(sentence_stats)
+    stats_b = df["response_b"].apply(sentence_stats)
+
+    df["resp_a_sent_count"] = stats_a.apply(lambda x: x[0])
+    df["resp_a_avg_sent_len"] = stats_a.apply(lambda x: x[1])
+    df["resp_a_sent_var"] = stats_a.apply(lambda x: x[2])
+
+    df["resp_b_sent_count"] = stats_b.apply(lambda x: x[0])
+    df["resp_b_avg_sent_len"] = stats_b.apply(lambda x: x[1])
+    df["resp_b_sent_var"] = stats_b.apply(lambda x: x[2])
+
+    df["sent_count_diff"] = df["resp_b_sent_count"] - df["resp_a_sent_count"]
+    df["avg_sent_len_diff"] = df["resp_b_avg_sent_len"] - df["resp_a_avg_sent_len"]
+    df["sent_var_diff"] = df["resp_b_sent_var"] - df["resp_a_sent_var"]
+
+    df["resp_a_overlap"] = df.apply(lambda r: keyword_overlap(r["prompt"], r["response_a"]), axis=1)
+    df["resp_b_overlap"] = df.apply(lambda r: keyword_overlap(r["prompt"], r["response_b"]), axis=1)
+    df["overlap_diff"] = df["resp_b_overlap"] - df["resp_a_overlap"]
+    df["overlap_ratio"] = df["resp_b_overlap"] / (df["resp_a_overlap"] + 0.001)
+
+    df["resp_a_confidence"] = df["response_a"].str.count(CONFIDENCE_RE, flags=re.I)
+    df["resp_b_confidence"] = df["response_b"].str.count(CONFIDENCE_RE, flags=re.I)
+    df["confidence_diff"] = df["resp_b_confidence"] - df["resp_a_confidence"]
+
+    df["resp_a_is_ai"] = df["response_a"].str.lower().str.count(r"an ai")
+    df["resp_b_is_ai"] = df["response_b"].str.lower().str.count(r"an ai")
+    df["ai_diff"] = df["resp_b_is_ai"] - df["resp_a_is_ai"]
+
+    # langdetect disabled in Kaggle
+    df["is_prompt_en"] = 0
+    df["a_lang_match"] = 0
+    df["b_lang_match"] = 0
+    df["lang_match_diff"] = 0
+
+    df["resp_a_lexdiv"] = df["response_a"].apply(lexical_diversity)
+    df["resp_b_lexdiv"] = df["response_b"].apply(lexical_diversity)
+    df["lexdiv_diff"] = df["resp_b_lexdiv"] - df["resp_a_lexdiv"]
+
+    df["resp_a_vocab_rich"] = df["response_a"].apply(vocab_richness)
+    df["resp_b_vocab_rich"] = df["response_b"].apply(vocab_richness)
+    df["vocab_rich_diff"] = df["resp_b_vocab_rich"] - df["resp_a_vocab_rich"]
+
+    df["resp_a_hedge"] = df["response_a"].apply(lambda t: count_lexicon(t, HEDGE_LEXICON))
+    df["resp_b_hedge"] = df["response_b"].apply(lambda t: count_lexicon(t, HEDGE_LEXICON))
+    df["hedge_diff"] = df["resp_b_hedge"] - df["resp_a_hedge"]
+
+    df["resp_a_polite"] = df["response_a"].apply(lambda t: count_lexicon(t, POLITENESS_LEXICON))
+    df["resp_b_polite"] = df["response_b"].apply(lambda t: count_lexicon(t, POLITENESS_LEXICON))
+    df["polite_diff"] = df["resp_b_polite"] - df["resp_a_polite"]
+
+    df["resp_a_refusal"] = df["response_a"].apply(refusal_score)
+    df["resp_b_refusal"] = df["response_b"].apply(refusal_score)
+    df["refusal_diff"] = df["resp_b_refusal"] - df["resp_a_refusal"]
+    df["resp_a_has_refusal"] = (df["resp_a_refusal"] > 0).astype(int)
+    df["resp_b_has_refusal"] = (df["resp_b_refusal"] > 0).astype(int)
+    df["has_refusal_diff"] = df["resp_b_has_refusal"] - df["resp_a_has_refusal"]
+
+    # textstat disabled
+    df["resp_a_readability"] = 0.0
+    df["resp_b_readability"] = 0.0
+    df["readability_diff"] = 0.0
+
+    # TextBlob polarity
+    if HAS_TEXTBLOB:
+        df["resp_a_sentiment"] = df["response_a"].apply(tb_polarity)
+        df["resp_b_sentiment"] = df["response_b"].apply(tb_polarity)
+        df["sentiment_diff"] = df["resp_b_sentiment"] - df["resp_a_sentiment"]
+    else:
+        df["resp_a_sentiment"] = 0.0
+        df["resp_b_sentiment"] = 0.0
+        df["sentiment_diff"] = 0.0
+
+    # VADER sentiment
+    if HAS_VADER:
+        prompt_v = df["prompt"].apply(vader_scores)
+        resp_a_v = df["response_a"].apply(vader_scores)
+        resp_b_v = df["response_b"].apply(vader_scores)
+
+        for key in ("neg", "neu", "pos", "compound"):
+            df[f"prompt_{key}"] = prompt_v.apply(lambda x: x[key])
+            df[f"resp_a_{key}"] = resp_a_v.apply(lambda x: x[key])
+            df[f"resp_b_{key}"] = resp_b_v.apply(lambda x: x[key])
+            df[f"{key}_diff"] = df[f"resp_b_{key}"] - df[f"resp_a_{key}"]
+    else:
+        for key in ("neg", "neu", "pos", "compound"):
+            df[f"prompt_{key}"] = 0.0
+            df[f"resp_a_{key}"] = 0.0
+            df[f"resp_b_{key}"] = 0.0
+            df[f"{key}_diff"] = 0.0
+
+    df["prompt_punct_count"] = df["prompt"].str.count(r"[.,;:!?\-]")
+    df["prompt_punct_per_word"] = df["prompt_punct_count"] / (df["prompt_word_count"] + 1)
+    df["prompt_has_question"] = df["prompt"].str.contains(r"\?").astype(int)
+
+    # Interactions
+    df["len_x_overlap"] = df["len_ratio"] * df["overlap_ratio"]
+    if HAS_VADER:
+        df["len_x_compound"] = df["len_ratio"] * (df["resp_b_compound"] / (df["resp_a_compound"].abs() + 0.001))
+    else:
+        df["len_x_compound"] = 0.0
+
+    return df
+
+print("Engineering train features...")
+train = engineer_all(train)
+print("Engineering test features...")
+test = engineer_all(test)
+
+# TF-IDF + SVD diffs + similarities
+print("Fitting TF-IDF + SVD (unigram)...")
+all_text = pd.concat([train["response_a"], train["response_b"], test["response_a"], test["response_b"]]).astype(str)
+
+tfidf = TfidfVectorizer(max_features=10000, stop_words="english")
+tfidf.fit(all_text)
+
+svd = TruncatedSVD(n_components=50, random_state=42)
+svd.fit(tfidf.transform(all_text))
+svd_cols = [f"svd_diff_{i}" for i in range(50)]
+
+diff_train = svd.transform(tfidf.transform(train["response_b"])) - svd.transform(tfidf.transform(train["response_a"]))
+diff_test  = svd.transform(tfidf.transform(test["response_b"]))  - svd.transform(tfidf.transform(test["response_a"]))
+
+train = pd.concat([train, pd.DataFrame(diff_train, columns=svd_cols, index=train.index)], axis=1)
+test  = pd.concat([test,  pd.DataFrame(diff_test,  columns=svd_cols, index=test.index)], axis=1)
+
+print("Fitting TF-IDF + SVD (bigram)...")
+tfidf_bi = TfidfVectorizer(max_features=5000, ngram_range=(2, 2), stop_words="english")
+tfidf_bi.fit(all_text)
+
+svd_bi = TruncatedSVD(n_components=25, random_state=42)
+svd_bi.fit(tfidf_bi.transform(all_text))
+bi_cols = [f"bigram_diff_{i}" for i in range(25)]
+
+diff_train_bi = svd_bi.transform(tfidf_bi.transform(train["response_b"])) - svd_bi.transform(tfidf_bi.transform(train["response_a"]))
+diff_test_bi  = svd_bi.transform(tfidf_bi.transform(test["response_b"]))  - svd_bi.transform(tfidf_bi.transform(test["response_a"]))
+
+train = pd.concat([train, pd.DataFrame(diff_train_bi, columns=bi_cols, index=train.index)], axis=1)
+test  = pd.concat([test,  pd.DataFrame(diff_test_bi,  columns=bi_cols, index=test.index)], axis=1)
+
+print("Computing prompt-response cosine similarities...")
+tfidf_full = TfidfVectorizer(max_features=30000, ngram_range=(1, 2), min_df=3, dtype=np.float32)
+tfidf_full.fit(
+    pd.concat(
+        [
+            train["prompt"], train["response_a"], train["response_b"],
+            test["prompt"],  test["response_a"],  test["response_b"],
+        ]
+    ).astype(str)
+)
+
+P_train = sk_normalize(tfidf_full.transform(train["prompt"]))
+A_train = sk_normalize(tfidf_full.transform(train["response_a"]))
+B_train = sk_normalize(tfidf_full.transform(train["response_b"]))
+
+P_test = sk_normalize(tfidf_full.transform(test["prompt"]))
+A_test = sk_normalize(tfidf_full.transform(test["response_a"]))
+B_test = sk_normalize(tfidf_full.transform(test["response_b"]))
+
+train["tf_sim_a"] = np.asarray(P_train.multiply(A_train).sum(axis=1)).reshape(-1)
+train["tf_sim_b"] = np.asarray(P_train.multiply(B_train).sum(axis=1)).reshape(-1)
+train["tf_sim_diff"] = train["tf_sim_b"] - train["tf_sim_a"]
+
+test["tf_sim_a"] = np.asarray(P_test.multiply(A_test).sum(axis=1)).reshape(-1)
+test["tf_sim_b"] = np.asarray(P_test.multiply(B_test).sum(axis=1)).reshape(-1)
+test["tf_sim_diff"] = test["tf_sim_b"] - test["tf_sim_a"]
+
+print("Computing response A-B similarity...")
+ta_train = sk_normalize(tfidf.transform(train["response_a"]))
+tb_train = sk_normalize(tfidf.transform(train["response_b"]))
+train["resp_similarity"] = np.asarray(ta_train.multiply(tb_train).sum(axis=1)).reshape(-1)
+
+ta_test = sk_normalize(tfidf.transform(test["response_a"]))
+tb_test = sk_normalize(tfidf.transform(test["response_b"]))
+test["resp_similarity"] = np.asarray(ta_test.multiply(tb_test).sum(axis=1)).reshape(-1)
+
+# Feature list
+base_feature_cols = [
+    "resp_a_len","resp_b_len","len_diff",
+    "resp_a_word_count","resp_b_word_count","word_count_diff",
+    "prompt_word_count","prompt_len",
+    "resp_a_len_ratio","resp_b_len_ratio","len_ratio_diff",
+    "len_ratio","word_ratio",
+    "resp_a_bold","resp_b_bold","bold_diff",
+    "resp_a_hash","resp_b_hash","hash_diff",
+    "resp_a_new_line","resp_b_new_line","new_line_diff",
+    "resp_a_code","resp_b_code","code_diff",
+    "resp_a_list","resp_b_list","list_diff",
+    "resp_a_excl","resp_b_excl","excl_diff",
+    "resp_a_question","resp_b_question","question_diff",
+    "resp_a_quote","resp_b_quote","quote_diff",
+    "resp_a_sentences","resp_b_sentences","sentence_diff","sentence_ratio",
+    "resp_a_sent_count","resp_b_sent_count","sent_count_diff",
+    "resp_a_avg_sent_len","resp_b_avg_sent_len","avg_sent_len_diff",
+    "resp_a_sent_var","resp_b_sent_var","sent_var_diff",
+    "resp_a_overlap","resp_b_overlap","overlap_diff","overlap_ratio",
+    "resp_a_confidence","resp_b_confidence","confidence_diff",
+    "resp_a_is_ai","resp_b_is_ai","ai_diff",
+    "resp_a_refusal","resp_b_refusal","refusal_diff",
+    "resp_a_has_refusal","resp_b_has_refusal","has_refusal_diff",
+    "resp_a_lexdiv","resp_b_lexdiv","lexdiv_diff",
+    "resp_a_vocab_rich","resp_b_vocab_rich","vocab_rich_diff",
+    "resp_a_hedge","resp_b_hedge","hedge_diff",
+    "resp_a_polite","resp_b_polite","polite_diff",
+    "prompt_punct_per_word","prompt_has_question",
+    "len_x_overlap","len_x_compound",
+    "tf_sim_a","tf_sim_b","tf_sim_diff",
+    "resp_similarity",
+    # guarded optional features
+    "resp_a_readability","resp_b_readability","readability_diff",
+    "resp_a_sentiment","resp_b_sentiment","sentiment_diff",
+    "prompt_compound","resp_a_compound","resp_b_compound","compound_diff",
+    "prompt_neg","resp_a_neg","resp_b_neg","neg_diff",
+    "prompt_pos","resp_a_pos","resp_b_pos","pos_diff",
+    "prompt_neu","resp_a_neu","resp_b_neu","neu_diff",
+    "is_prompt_en","a_lang_match","b_lang_match","lang_match_diff",
+]
+
+feature_cols = base_feature_cols + svd_cols + bi_cols
+
+# Offline safety
+feature_cols = [c for c in feature_cols if c in train.columns]
+
+print(f"Feature count: {len(feature_cols)}")
+
+# Labels + arrays
+le = LabelEncoder()
+y = le.fit_transform(train["winner"])
+X = train[feature_cols].values.astype(np.float32)
+X_test = test[feature_cols].values.astype(np.float32)
+
+N_CLASSES = len(le.classes_)
+class_to_idx = {c: i for i, c in enumerate(le.classes_)}
+print("Classes:", le.classes_, "->", class_to_idx)
+
+# Model params
+SEED = 42
+
+XGB_PARAMS = {
+    "objective": "multi:softprob",
+    "num_class": N_CLASSES,
+    "n_estimators": 954,
+    "learning_rate": 0.009268225722508726,
+    "max_depth": 6,
+    "min_child_weight": 2.0,
+    "subsample": 0.7734675561410428,
+    "colsample_bytree": 0.7418613785575431,
+    "reg_lambda": 0.018040058454210965,
+    "reg_alpha": 0.016672596278656325,
+    "tree_method": "hist",
+    "random_state": SEED,
+    "n_jobs": -1,
+    "eval_metric": "mlogloss",
+}
+
+LGB_PARAMS = {
+    "objective": "multiclass",
+    "num_class": N_CLASSES,
+    "metric": "multi_logloss",
+    "n_estimators": 799,
+    "learning_rate": 0.007930177493448862,
+    "num_leaves": 127,
+    "max_depth": 6,
+    "min_child_samples": 10,
+    "subsample": 0.896631599588464,
+    "colsample_bytree": 0.8186895703181992,
+    "reg_lambda": 1.9336104047881755,
+    "random_state": SEED,
+    "n_jobs": -1,
+    "verbosity": -1,
+}
+
+CAT_PARAMS = {
+    "loss_function": "MultiClass",
+    "eval_metric": "MultiClass",
+    "iterations": 1002,
+    "learning_rate": 0.03643294875759294,
+    "depth": 4,
+    "l2_leaf_reg": 0.024104502444253634,
+    "random_strength": 0.7625108000751513,
+    "bootstrap_type": "Bernoulli",
+    "subsample": 0.8618137090358877,
+    "rsm": 0.9335879435891674,
+    "min_data_in_leaf": 5,
+    "random_seed": SEED,
+    "verbose": 0,
+    "allow_writing_files": False,
+    "thread_count": -1,
+    "use_best_model": False,
+}
+
+# Ensemble weights
+# Previous attempt at OOF-optimized weights: W_XGB=0.3974, W_LGB=0.2255, W_CAT=0.3771
+W_XGB = 0.6117
+W_LGB = 0.2309
+W_CAT = 0.1575
+
+# Train full + predict
+def smooth_probs(p, eps=1e-12):
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p, eps, 1.0)
+    p = p / p.sum(axis=1, keepdims=True)
+    return p.astype(np.float32)
+
+print("Fitting XGBoost on full data...")
+xgb = XGBClassifier(**XGB_PARAMS)
+xgb.fit(X, y)
+p_xgb = smooth_probs(xgb.predict_proba(X_test))
+
+print("Fitting LightGBM on full data...")
+lgbm = LGBMClassifier(**LGB_PARAMS)
+lgbm.fit(X, y)
+p_lgb = smooth_probs(lgbm.predict_proba(X_test))
+
+print("Fitting CatBoost on full data...")
+cat = CatBoostClassifier(**CAT_PARAMS)
+cat.fit(X, y)
+p_cat = smooth_probs(cat.predict_proba(X_test))
+
+# Ensemble + submission
+p_ens = W_XGB * p_xgb + W_LGB * p_lgb + W_CAT * p_cat
+p_ens = smooth_probs(p_ens)
+
+submission = pd.DataFrame({
+    "id": test["id"].values,
+    "winner_model_a": p_ens[:, class_to_idx.get("A", 0)],
+    "winner_model_b": p_ens[:, class_to_idx.get("B", 1)],
+    "winner_tie":     p_ens[:, class_to_idx.get("Tie", 2)],
+})
+
+submission.to_csv("/kaggle/working/submission.csv", index=False)
+print("Saved: /kaggle/working/submission.csv")
+submission.head()
