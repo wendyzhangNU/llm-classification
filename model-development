@@ -1091,6 +1091,7 @@ if best_n_cat is None or best_n_cat <= 0:
 
 cat_final_params = dict(best_cat_params_q)
 cat_final_params["iterations"] = int(best_n_cat)
+cat_final_params["use_best_model"] = False
 cat_final = CatBoostClassifier(**cat_final_params)
 cat_final.fit(X, y)
 p_test_cat = smooth_probs(cat_final.predict_proba(X_test))
